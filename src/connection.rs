@@ -55,16 +55,7 @@ impl Connection {
     }
 
     pub async fn write_frame(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
-        match frame {
-            Frame::Array(array) => {
-                self.stream.write_u8(b'*').await?;
-                self.write_decimal(array.len() as i64).await?;
-                for val in array {
-                    self.write_value(val).await?;
-                }
-            }
-            other => self.write_value(other).await?,
-        }
+        self.write_value(frame).await?;
         let res = self.stream.flush().await;
         if let Err(e) = res {
             Err(e.into())
@@ -99,9 +90,13 @@ impl Connection {
                 self.stream.write_all(b"\r\n").await?;
                 Ok(())
             }
-            Frame::Array(_) => {
-                // add recursive support for encoding nested arrays
-                todo!("nested arrays not supported yet");
+            Frame::Array(response) => {
+                self.stream.write_u8(b'*').await?;
+                self.write_decimal(response.len() as i64).await?;
+                for val in response {
+                    Box::pin(self.write_value(val)).await?;
+                }
+                Ok(())
             }
             Frame::Null => {
                 self.stream.write_all(b"-1\r\n").await?;
@@ -165,6 +160,24 @@ mod tests {
         let expected = b":42\r\n";
 
         connection.write_frame(Frame::Integer(42)).await.unwrap();
+
+        let mut actual = vec![0; expected.len()];
+        peer.read_exact(&mut actual).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn write_frame_writes_nested_resp_arrays() {
+        let (mut connection, mut peer) = connection_pair().await;
+        let expected = b"*2\r\n+outer\r\n*2\r\n:1\r\n:2\r\n";
+
+        connection
+            .write_frame(Frame::Array(vec![
+                Frame::Simple("outer".into()),
+                Frame::Array(vec![Frame::Integer(1), Frame::Integer(2)]),
+            ]))
+            .await
+            .unwrap();
 
         let mut actual = vec![0; expected.len()];
         peer.read_exact(&mut actual).await.unwrap();
