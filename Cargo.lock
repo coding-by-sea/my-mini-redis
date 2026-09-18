@@ -30,6 +30,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "async-stream"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -56,6 +62,15 @@ name = "atoi"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5c897df197d57c25b37df9d8fa2f93ddbfeee9ebd2264350ac79c8ec4b795885"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "atoi"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e7a8bbe9949e43a1edaa043038c68703b04774156afdfb62ba2cef5bf93d67be"
 dependencies = [
  "num-traits",
 ]
@@ -297,7 +312,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528890a6b63c88c9bda173867128abe62c0f5050dd959f067aeea09e90439f33"
 dependencies = [
  "async-stream",
- "atoi",
+ "atoi 0.3.3",
  "bytes",
  "structopt",
  "tokio",
@@ -322,6 +337,8 @@ dependencies = [
 name = "my-redis"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "atoi 3.1.0",
  "bytes",
  "mini-redis",
  "tokio",
