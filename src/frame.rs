@@ -3,6 +3,7 @@ use std::fmt;
 use std::fmt::Formatter;
 use std::io::Cursor;
 
+#[derive(Debug)]
 pub enum Frame {
     Simple(String),
     Error(String),

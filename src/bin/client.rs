@@ -1,49 +1,69 @@
-use mini_redis::{client};
-use tokio::sync::{mpsc, oneshot};
-
 use bytes::Bytes;
-type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
-#[derive(Debug)]
+use clap::{Parser, Subcommand};
+use mini_redis::client;
+
+const ADDRESS: &str = "127.0.0.1:6379";
+
+#[derive(Debug, Parser)]
+#[command(name = "my-mini-redis", about = "A command-line client for mini-redis")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
 enum Command {
-    Get {
-        key: String,
-        resp: Responder<Option<Bytes>>,
-    },
-    Set {
-        key: String,
-        val: Bytes,
-        resp: Responder<()>,
-    }
+    /// Retrieve the value stored at a key.
+    Get { key: String },
+    /// Store a value at a key.
+    Set { key: String, value: String },
 }
 
 #[tokio::main]
-async fn main() {
-    let (sender, mut receiver) = mpsc::channel::<Command>(10);
-    let manager = tokio::spawn(async move {
-        let mut client = client::connect("127.0.0.1:6379").await.unwrap();
-        while let Some(cmd) = receiver.recv().await {
-            match cmd {
-                Command::Get { key, resp } => {
-                    resp.send(client.get(&key).await).unwrap();
-                }
-                Command::Set { key, val, resp } => {
-                    resp.send(client.set(&key, val.clone()).await).unwrap();
-                }
-            }
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let mut client = client::connect(ADDRESS)
+        .await
+        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+
+    match cli.command {
+        Command::Get { key } => match client
+            .get(&key)
+            .await
+            .map_err(|error| anyhow::Error::msg(error.to_string()))?
+        {
+            Some(value) => println!("{}", String::from_utf8_lossy(&value)),
+            None => println!("(nil)"),
+        },
+        Command::Set { key, value } => {
+            client
+                .set(&key, Bytes::from(value))
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            println!("OK");
         }
-    });
-    {
-        let sender = sender.clone();
-        let (tx, rx) = oneshot::channel();
-        sender.send(Command::Set { key: "hello".to_string(), val: Bytes::from("world"), resp: tx }).await.unwrap();
-        println!("{:?}", rx.await.unwrap());
     }
 
-    {
-        let sender = sender.clone();
-        let (tx, rx) = oneshot::channel();
-        sender.send(Command::Get { key: "hello".to_string(), resp: tx }).await.unwrap();
-        println!("{:?}", rx.await.unwrap());
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn parses_get() {
+        let cli = Cli::try_parse_from(["client", "get", "greeting"]).unwrap();
+        assert!(matches!(cli.command, Command::Get { key } if key == "greeting"));
     }
-    manager.await.unwrap();
+
+    #[test]
+    fn parses_set() {
+        let cli = Cli::try_parse_from(["client", "set", "greeting", "hello"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Set { key, value } if key == "greeting" && value == "hello")
+        );
+    }
 }

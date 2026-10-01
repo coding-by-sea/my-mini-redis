@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use mini_redis::{Connection, Frame, Command};
-use mini_redis::Command::{Set, Get};
+use my_redis::connection::Connection;
+use my_redis::frame::Frame;
+use my_redis::command::Command::{self, Set, Get};
 use tokio::net::{TcpListener, TcpStream};
 use bytes::Bytes;
+
 type Db = Arc<Mutex<HashMap<String, Bytes>>>;
 
 #[tokio::main]
@@ -28,7 +30,7 @@ async fn handle(socket: TcpStream, db: Db) {
         let response = match Command::from_frame(frame).unwrap() {
             Set(cmd) => {
                 let mut db = db.lock().unwrap();
-                db.insert(cmd.key().to_string(), cmd.value().clone());
+                db.insert(cmd.key().to_string(), cmd.value());
                 Frame::Simple("OK".into())
             }
             Get(cmd) => {
@@ -41,7 +43,7 @@ async fn handle(socket: TcpStream, db: Db) {
             }
             _ => panic!("not implemented"),
         };
-        connection.write_frame(&response).await.unwrap();
+        connection.write_frame(response).await.unwrap();
     }
 
 }
