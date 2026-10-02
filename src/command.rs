@@ -21,7 +21,7 @@ impl Command {
     pub fn from_frame(frame: Frame) -> anyhow::Result<Command> {
         let mut parse = Parse::new(frame)?;
         let string = parse.next_string()?;
-        match string.as_str() {
+        match string.to_lowercase().as_str() {
             "get" => {
                 Ok(Command::Get(
                     Get { key:  parse.next_string()?},

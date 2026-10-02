@@ -13,5 +13,5 @@ clap = { version = "4", features = ["derive"] }
 thiserror = "2.0.21"
 
 [[bin]]
-name = "my-mini-redis"
+name = "my-mini-redis-cli"
 path = "src/bin/client.rs"
