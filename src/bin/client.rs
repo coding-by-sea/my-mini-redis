@@ -1,6 +1,8 @@
+use tokio::net::TcpStream;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use mini_redis::client;
+use my_redis::connection::Connection;
+use my_redis::frame::Frame;
 
 const ADDRESS: &str = "127.0.0.1:6379";
 
@@ -19,10 +21,39 @@ enum Command {
     Set { key: String, value: String },
 }
 
+struct Client {
+    connection: Connection,
+}
+
+impl Client {
+    pub async fn new() -> anyhow::Result<Self> {
+        let connection = TcpStream::connect(ADDRESS).await?;
+        Ok(Client {connection: Connection::new(connection)})
+    }
+
+    pub async fn set(&mut self, key: &str, value: Bytes) -> anyhow::Result<()> {
+        let set_frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"GET")), Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())), Frame::Bulk(Bytes::from(value))]);
+        self.connection.write_frame(set_frame).await?;
+        Ok(())
+    }
+
+    pub async fn get(&mut self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        let get_frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"GET")), Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())), Frame::Bulk(Bytes::from_static(b""))]);
+        self.connection.write_frame(get_frame).await?;
+        let response = self.connection.read_frame().await?;
+        match response {
+            Some(Frame::Bulk(bytes)) => Ok(Some(bytes)),
+            None => Ok(None),
+            _ => unreachable!(),
+        }
+    }
+}
+
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut client = client::connect(ADDRESS)
+    let mut client = Client::new()
         .await
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
 
