@@ -58,8 +58,10 @@ impl Connection {
         self.write_value(frame).await?;
         let res = self.stream.flush().await;
         if let Err(e) = res {
+            println!("Error: {:?}", e);
             Err(e.into())
         } else {
+            println!("Ok: {:?}", res);
             Ok(())
         }
     }
@@ -99,7 +101,7 @@ impl Connection {
                 Ok(())
             }
             Frame::Null => {
-                self.stream.write_all(b"-1\r\n").await?;
+                self.stream.write_all(b"$-1\r\n").await?;
                 Ok(())
             },
         }
