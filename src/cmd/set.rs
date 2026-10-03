@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use crate::connection::Connection;
+use crate::Db;
 use crate::frame::Frame;
 
 pub struct Set {
@@ -25,5 +27,14 @@ impl Set {
                 Frame::Bulk(self.value),
             ]
         )
+    }
+
+    pub async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
+        {
+            let mut db = db.lock().unwrap();
+            db.insert(self.key().to_string(), self.value());
+        }
+        let response = Frame::Simple("OK".into());
+        connection.write_frame(response).await
     }
 }

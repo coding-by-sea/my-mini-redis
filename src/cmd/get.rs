@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use crate::connection::Connection;
+use crate::Db;
 use crate::frame::Frame;
 
 pub struct Get {
@@ -19,6 +21,18 @@ impl Get {
                 Frame::Bulk(Bytes::from(self.key.into_bytes())),
             ]
         )
+    }
+
+    pub async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
+        let response = {
+            let db = db.lock().unwrap();
+            if let Some(value) = db.get(&self.key().to_string()) {
+                Frame::Bulk(value.clone())
+            } else {
+                Frame::Null
+            }
+        };
+        connection.write_frame(response).await
     }
 }
 
