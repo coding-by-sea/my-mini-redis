@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use my_redis::connection::Connection;
 use my_redis::frame::Frame;
-use my_redis::command::Command::{self, Set, Get};
+use my_redis::cmd::Command::{self, Set, Get};
 use tokio::net::{TcpListener, TcpStream};
 use bytes::Bytes;
 
@@ -41,7 +41,6 @@ async fn handle(socket: TcpStream, db: Db) {
                     Frame::Null
                 }
             }
-            _ => panic!("not implemented"),
         };
         connection.write_frame(response).await.unwrap();
     }

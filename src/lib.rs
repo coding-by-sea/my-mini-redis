@@ -1,5 +1,5 @@
 pub mod connection;
 pub mod frame;
 
-pub mod command;
+pub mod cmd;
 pub(crate) mod parse;

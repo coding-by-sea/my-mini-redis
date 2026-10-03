@@ -1,7 +1,7 @@
 use tokio::net::TcpStream;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use my_redis::command::{Get, Set};
+use my_redis::cmd::{Get, Set};
 use my_redis::connection::Connection;
 use my_redis::frame::Frame;
 
@@ -37,7 +37,7 @@ impl Client {
         self.connection.write_frame(set_frame).await?;
         let response = self.connection.read_frame().await?;
         match response {
-            Some(Frame::Simple(s)) => Ok(()),
+            Some(Frame::Simple(_)) => Ok(()),
             Some(Frame::Error(err)) => anyhow::bail!(err),
             _ => unreachable!(),
         }
