@@ -1,5 +1,5 @@
-use std::assert_matches;
 use bytes::{Buf, Bytes};
+use std::assert_matches;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::Cursor;
@@ -44,7 +44,6 @@ impl Frame {
             }
             _ => unreachable!(),
         }
-
     }
     // return whether there is at least a complete frame in bytes
     pub(crate) fn check(bytes: &mut Cursor<&[u8]>) -> Result<(), Error> {

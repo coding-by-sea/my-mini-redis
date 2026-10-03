@@ -1,6 +1,8 @@
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use my_redis::DEFAULT_ADDRESS;
 use my_redis::client::Client;
+use std::env;
 
 #[derive(Debug, Parser)]
 #[command(name = "my-mini-redis", about = "A command-line client for mini-redis")]
@@ -20,7 +22,8 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let mut client = Client::new()
+    let address = env::var("MY_MINI_REDIS_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.to_owned());
+    let mut client = Client::new_with_address(&address)
         .await
         .map_err(|error| anyhow::Error::msg(error.to_string()))?;
 

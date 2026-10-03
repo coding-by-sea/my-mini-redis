@@ -1,9 +1,9 @@
-use bytes::Bytes;
-use tokio::net::TcpStream;
-use crate::ADDRESS;
+use crate::DEFAULT_ADDRESS;
 use crate::cmd::{Get, Set};
 use crate::connection::Connection;
 use crate::frame::Frame;
+use bytes::Bytes;
+use tokio::net::TcpStream;
 
 pub struct Client {
     connection: Connection,
@@ -11,8 +11,14 @@ pub struct Client {
 
 impl Client {
     pub async fn new() -> anyhow::Result<Self> {
-        let connection = TcpStream::connect(ADDRESS).await?;
-        Ok(Client {connection: Connection::new(connection)})
+        Self::new_with_address(DEFAULT_ADDRESS).await
+    }
+
+    pub async fn new_with_address(address: &str) -> anyhow::Result<Self> {
+        let connection = TcpStream::connect(address).await?;
+        Ok(Client {
+            connection: Connection::new(connection),
+        })
     }
 
     pub async fn set(&mut self, key: &str, value: Bytes) -> anyhow::Result<()> {

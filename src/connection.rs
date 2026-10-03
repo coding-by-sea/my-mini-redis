@@ -1,10 +1,10 @@
-use std::io::{Cursor, Error, ErrorKind};
+use super::frame::Error as FrameError;
+use super::frame::Frame;
+use anyhow;
 use bytes::{Buf, BytesMut};
+use std::io::{Cursor, Error, ErrorKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
-use super::frame::Frame;
-use super::frame::Error as FrameError;
-use anyhow;
 
 pub struct Connection {
     stream: BufWriter<TcpStream>,
@@ -30,7 +30,7 @@ impl Connection {
                     Ok(None)
                 } else {
                     Err(Error::from(ErrorKind::ConnectionReset).into())
-                }
+                };
             }
         }
     }
@@ -45,12 +45,8 @@ impl Connection {
                 self.buffer.advance(len);
                 Ok(Some(frame))
             }
-            Err(FrameError::IncompleteFrame) => {
-                Ok(None)
-            }
-            Err(e) => {
-                Err(e.into())
-            }
+            Err(FrameError::IncompleteFrame) => Ok(None),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -101,7 +97,7 @@ impl Connection {
             Frame::Null => {
                 self.stream.write_all(b"$-1\r\n").await?;
                 Ok(())
-            },
+            }
         }
     }
 

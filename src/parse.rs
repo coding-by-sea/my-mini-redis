@@ -1,7 +1,7 @@
-use std::{vec};
-use bytes::Bytes;
-use thiserror::Error;
 use crate::frame::Frame;
+use bytes::Bytes;
+use std::vec;
+use thiserror::Error;
 
 pub(crate) struct Parse {
     parts: vec::IntoIter<Frame>,
@@ -37,12 +37,10 @@ impl Parse {
 
     pub(crate) fn next_string(&mut self) -> ParseResult<String> {
         match self.parts.next() {
-            Some(frame) => {
-                match frame {
-                    Frame::Simple(s) => Ok(s),
-                    Frame::Bulk(bytes) => Ok(String::from_utf8(bytes.to_vec()).unwrap()),
-                    _ => Err(ParseError::InvalidCommand.into()),
-                }
+            Some(frame) => match frame {
+                Frame::Simple(s) => Ok(s),
+                Frame::Bulk(bytes) => Ok(String::from_utf8(bytes.to_vec()).unwrap()),
+                _ => Err(ParseError::InvalidCommand.into()),
             },
             None => Err(ParseError::EndOfInput.into()),
         }
@@ -50,16 +48,11 @@ impl Parse {
 
     pub(crate) fn next_bytes(&mut self) -> ParseResult<Bytes> {
         match self.parts.next() {
-            Some(frame) => {
-                match frame {
-                    Frame::Bulk(bytes) => Ok(bytes),
-                    _ => Err(ParseError::InvalidCommand.into()),
-                }
+            Some(frame) => match frame {
+                Frame::Bulk(bytes) => Ok(bytes),
+                _ => Err(ParseError::InvalidCommand.into()),
             },
             None => Err(ParseError::EndOfInput.into()),
         }
     }
-
-
-
 }
