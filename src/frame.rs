@@ -1,3 +1,4 @@
+use std::assert_matches;
 use bytes::{Buf, Bytes};
 use std::fmt;
 use std::fmt::Formatter;
@@ -29,6 +30,22 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Frame {
+    /// Returns an empty array
+    pub(crate) fn array() -> Frame {
+        Frame::Array(vec![])
+    }
+
+    // this only applies to Frame::Array
+    pub(crate) fn add_to_array(&mut self, frame: Frame) {
+        assert_matches!(self, Frame::Array(_));
+        match self {
+            Frame::Array(vec) => {
+                vec.push(frame);
+            }
+            _ => unreachable!(),
+        }
+
+    }
     // return whether there is at least a complete frame in bytes
     pub(crate) fn check(bytes: &mut Cursor<&[u8]>) -> Result<(), Error> {
         match Self::get_u8(bytes)? {

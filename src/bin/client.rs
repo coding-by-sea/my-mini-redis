@@ -1,6 +1,7 @@
 use tokio::net::TcpStream;
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
+use my_redis::command::{Get, Set};
 use my_redis::connection::Connection;
 use my_redis::frame::Frame;
 
@@ -32,13 +33,18 @@ impl Client {
     }
 
     pub async fn set(&mut self, key: &str, value: Bytes) -> anyhow::Result<()> {
-        let set_frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"SET")), Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())), Frame::Bulk(Bytes::from(value))]);
+        let set_frame = Set::new(key, value).into_frame();
         self.connection.write_frame(set_frame).await?;
-        Ok(())
+        let response = self.connection.read_frame().await?;
+        match response {
+            Some(Frame::Simple(s)) => Ok(()),
+            Some(Frame::Error(err)) => anyhow::bail!(err),
+            _ => unreachable!(),
+        }
     }
 
     pub async fn get(&mut self, key: &str) -> anyhow::Result<Option<Bytes>> {
-        let get_frame = Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"GET")), Frame::Bulk(Bytes::copy_from_slice(key.as_bytes())), Frame::Bulk(Bytes::from_static(b""))]);
+        let get_frame = Get::new(key).into_frame();
         self.connection.write_frame(get_frame).await?;
         let response = self.connection.read_frame().await?;
         match response {

@@ -38,17 +38,25 @@ impl Command {
 }
 
 impl Get {
-    pub fn new(key: String) -> Self {
-        Self { key }
+    pub fn new(key: impl ToString) -> Self {
+        Self { key: key.to_string() }
     }
     pub fn key(&self) -> &str {
         &self.key
     }
+    pub fn into_frame(self) -> Frame {
+        Frame::Array(
+            vec![
+                Frame::Bulk(Bytes::from_static(b"GET")),
+                Frame::Bulk(Bytes::from(self.key.into_bytes())),
+            ]
+        )
+    }
 }
 
 impl Set {
-    pub fn new(key: String, value: Bytes) -> Self {
-        Self { key, value }
+    pub fn new(key: impl ToString, value: Bytes) -> Self {
+        Self { key: key.to_string(), value }
     }
     pub fn key(&self) -> &str {
         &self.key
@@ -56,5 +64,15 @@ impl Set {
 
     pub fn value(&self) -> Bytes {
         self.value.clone()
+    }
+
+    pub fn into_frame(self) -> Frame {
+        Frame::Array(
+            vec![
+                Frame::Bulk(Bytes::from_static(b"SET")),
+                Frame::Bulk(Bytes::from(self.key.into_bytes())),
+                Frame::Bulk(self.value),
+            ]
+        )
     }
 }
