@@ -1,10 +1,9 @@
 use bytes::Bytes;
 use tokio::net::TcpStream;
+use crate::ADDRESS;
 use crate::cmd::{Get, Set};
 use crate::connection::Connection;
 use crate::frame::Frame;
-
-const ADDRESS: &str = "127.0.0.1:6379";
 
 pub struct Client {
     connection: Connection,

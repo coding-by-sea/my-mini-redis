@@ -15,3 +15,7 @@ thiserror = "2.0.21"
 [[bin]]
 name = "my-mini-redis-cli"
 path = "src/bin/client.rs"
+
+[[bin]]
+name = "my-mini-redis-server"
+path = "src/bin/server.rs"
