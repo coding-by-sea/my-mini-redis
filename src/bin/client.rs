@@ -17,6 +17,8 @@ enum Command {
     Get { key: String },
     /// Store a value at a key.
     Set { key: String, value: String },
+    /// Subscribe to a channel.
+    Subscribe { name: String },
 }
 
 #[tokio::main]
@@ -41,6 +43,14 @@ async fn main() -> anyhow::Result<()> {
                 .set(&key, Bytes::from(value))
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        }
+        Command::Subscribe { name } => {
+            let value = client
+                .subscribe(&name)
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+           println!("{}", String::from_utf8_lossy(&value));
+           client.enter_subscribe_mode().await?;
         }
     }
 

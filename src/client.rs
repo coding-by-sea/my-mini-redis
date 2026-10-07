@@ -1,5 +1,5 @@
 use crate::DEFAULT_ADDRESS;
-use crate::cmd::{Get, Set};
+use crate::cmd::{Get, Set, Subscribe};
 use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
@@ -43,4 +43,27 @@ impl Client {
             _ => unreachable!(),
         }
     }
+
+    pub async fn subscribe(&mut self, name: &str) -> anyhow::Result<Bytes> {
+        let set_frame = Subscribe::new(name).into_frame();
+        self.connection.write_frame(set_frame).await?;
+        let response = self.connection.read_frame().await?;
+        match response {
+            Some(Frame::Bulk(bytes)) => Ok(bytes),
+            Some(Frame::Error(err)) => anyhow::bail!(err),
+            _ => unreachable!(),
+        }
+    }
+
+    pub async fn enter_subscribe_mode(&mut self) -> anyhow::Result<()> {
+        loop {
+            let response = self.connection.read_frame().await?;
+            match response {
+                Some(Frame::Bulk(bytes)) => println!("{:?}", Bytes::from(bytes)),
+                Some(Frame::Error(err)) => anyhow::bail!(err),
+                _ => unreachable!(),
+            }
+        }
+    }
+
 }

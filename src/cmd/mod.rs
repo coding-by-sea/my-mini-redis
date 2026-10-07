@@ -27,6 +27,7 @@ impl Command {
                 parse.next_string()?,
                 parse.next_bytes()?,
             ))),
+            "subscribe" => Ok(Command::Subscribe(Subscribe::new(parse.next_string()?))),
             _ => Err(anyhow!("cannot execute command {:?}", string)),
         }
     }
