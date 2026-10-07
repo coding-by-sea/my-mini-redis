@@ -1,4 +1,4 @@
-use crate::{Db};
+use crate::Db;
 use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
@@ -37,7 +37,12 @@ impl Subscribe {
                 receiver = rx;
             }
         }
-        connection.write_frame(Frame::Bulk(Bytes::from(format!("subscribe {}", self.channel)))).await?;
+        connection
+            .write_frame(Frame::Bulk(Bytes::from(format!(
+                "subscribe {}",
+                self.channel
+            ))))
+            .await?;
         loop {
             let bytes = receiver.recv().await?;
             connection.write_frame(Frame::Bulk(bytes)).await?;

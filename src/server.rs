@@ -1,4 +1,4 @@
-use crate::cmd::Command::{self, Get, Set, Subscribe};
+use crate::cmd::Command::{self, Get, Publish, Set, Subscribe};
 use crate::connection::Connection;
 use crate::{DEFAULT_ADDRESS, Db};
 use tokio::net::{TcpListener, TcpStream};
@@ -37,6 +37,7 @@ impl Server {
                 Set(cmd) => cmd.apply(db.clone(), &mut connection).await,
                 Get(cmd) => cmd.apply(db.clone(), &mut connection).await,
                 Subscribe(cmd) => cmd.apply(db.clone(), &mut connection).await,
+                Publish(cmd) => cmd.apply(db.clone(), &mut connection).await,
             };
             if let Err(e) = result {
                 println!("ERROR: {:?}", e);

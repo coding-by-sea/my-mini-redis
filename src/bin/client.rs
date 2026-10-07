@@ -17,6 +17,8 @@ enum Command {
     Get { key: String },
     /// Store a value at a key.
     Set { key: String, value: String },
+    /// Publish a message to a channel.
+    Publish { channel: String, message: String },
     /// Subscribe to a channel.
     Subscribe { name: String },
 }
@@ -44,13 +46,18 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
         }
+        Command::Publish { channel, message } => {
+            client
+                .publish(&channel, Bytes::from(message))
+                .await
+                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+        }
         Command::Subscribe { name } => {
-            let value = client
+            client
                 .subscribe(&name)
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-           println!("{}", String::from_utf8_lossy(&value));
-           client.enter_subscribe_mode().await?;
+            client.enter_subscribe_mode().await?;
         }
     }
 
@@ -74,6 +81,14 @@ mod tests {
         let cli = Cli::try_parse_from(["client", "set", "greeting", "hello"]).unwrap();
         assert!(
             matches!(cli.command, Command::Set { key, value } if key == "greeting" && value == "hello")
+        );
+    }
+
+    #[test]
+    fn parses_publish() {
+        let cli = Cli::try_parse_from(["client", "publish", "events", "created"]).unwrap();
+        assert!(
+            matches!(cli.command, Command::Publish { channel, message } if channel == "events" && message == "created")
         );
     }
 }

@@ -1,5 +1,5 @@
 use crate::DEFAULT_ADDRESS;
-use crate::cmd::{Get, Set, Subscribe};
+use crate::cmd::{Get, Publish, Set, Subscribe};
 use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
@@ -55,6 +55,19 @@ impl Client {
         }
     }
 
+    pub async fn publish(&mut self, channel: &str, message: Bytes) -> anyhow::Result<()> {
+        let publish_frame = Publish::new(channel, message).into_frame();
+        self.connection.write_frame(publish_frame).await?;
+
+        let response = match self.connection.read_frame().await? {
+            Some(Frame::Bulk(response)) => response,
+            Some(Frame::Error(err)) => anyhow::bail!(err),
+            _ => anyhow::bail!("invalid response to PUBLISH"),
+        };
+        println!("{:?}", response);
+        Ok(())
+    }
+
     pub async fn enter_subscribe_mode(&mut self) -> anyhow::Result<()> {
         loop {
             let response = self.connection.read_frame().await?;
@@ -65,5 +78,4 @@ impl Client {
             }
         }
     }
-
 }

@@ -7,6 +7,9 @@ pub use set::Set;
 mod subscribe;
 pub use subscribe::Subscribe;
 
+mod publish;
+pub use publish::Publish;
+
 use crate::frame::Frame;
 use crate::parse::Parse;
 use anyhow::anyhow;
@@ -15,6 +18,7 @@ pub enum Command {
     Get(Get),
     Set(Set),
     Subscribe(Subscribe),
+    Publish(Publish),
 }
 
 impl Command {
@@ -28,6 +32,10 @@ impl Command {
                 parse.next_bytes()?,
             ))),
             "subscribe" => Ok(Command::Subscribe(Subscribe::new(parse.next_string()?))),
+            "publish" => Ok(Command::Publish(Publish::new(
+                parse.next_string()?,
+                parse.next_bytes()?,
+            ))),
             _ => Err(anyhow!("cannot execute command {:?}", string)),
         }
     }

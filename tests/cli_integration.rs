@@ -16,6 +16,7 @@ async fn cli_set_and_get_round_trip_through_the_server() {
     assert_cli_output(&address, &["set", "greeting", "hello"], "");
     assert_cli_output(&address, &["get", "greeting"], "hello\n");
     assert_cli_output(&address, &["get", "missing"], "(nil)\n");
+    assert_cli_output(&address, &["publish", "events", "created"], "0\n");
 
     server.abort();
     let _ = server.await;
