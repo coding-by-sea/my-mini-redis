@@ -23,10 +23,10 @@ impl Get {
         ])
     }
 
-    pub async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
+    pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
         let response = {
             let db = db.lock().unwrap();
-            if let Some(value) = db.get(&self.key().to_string()) {
+            if let Some(value) = db.entries.get(&self.key().to_string()) {
                 Frame::Bulk(value.clone())
             } else {
                 Frame::Null

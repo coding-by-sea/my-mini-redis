@@ -4,6 +4,9 @@ pub use get::Get;
 mod set;
 pub use set::Set;
 
+mod subscribe;
+pub use subscribe::Subscribe;
+
 use crate::frame::Frame;
 use crate::parse::Parse;
 use anyhow::anyhow;
@@ -11,6 +14,7 @@ use anyhow::anyhow;
 pub enum Command {
     Get(Get),
     Set(Set),
+    Subscribe(Subscribe),
 }
 
 impl Command {

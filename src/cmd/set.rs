@@ -30,10 +30,10 @@ impl Set {
         ])
     }
 
-    pub async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
+    pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
         {
             let mut db = db.lock().unwrap();
-            db.insert(self.key().to_string(), self.value());
+            db.entries.insert(self.key().to_string(), self.value());
         }
         let response = Frame::Simple("OK".into());
         connection.write_frame(response).await
