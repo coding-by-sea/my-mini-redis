@@ -1,9 +1,8 @@
 use crate::Db;
 use crate::connection::Connection;
 use crate::frame::Frame;
+use crate::subscription::SubscriptionState;
 use bytes::Bytes;
-use tokio::sync::broadcast;
-use tokio::sync::broadcast::Receiver;
 
 pub struct Subscribe {
     channel: String,
@@ -25,27 +24,35 @@ impl Subscribe {
         ])
     }
 
-    pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
-        let mut receiver: Receiver<Bytes>;
-        {
-            let sub = &mut db.lock().unwrap().subscribers;
-            if let Some(sender) = sub.get(&self.channel().to_string()) {
-                receiver = sender.subscribe();
-            } else {
-                let (tx, rx) = broadcast::channel::<Bytes>(8);
-                sub.insert(self.channel().to_string(), tx.clone());
-                receiver = rx;
-            }
+    pub(crate) async fn apply(
+        self,
+        db: Db,
+        _connection: &mut Connection,
+        subscription_state: &mut Option<SubscriptionState>,
+    ) -> anyhow::Result<Frame> {
+        // Get or create the broadcast receiver for this channel
+        let receiver = {
+            let mut db = db.lock().unwrap();
+            db.subscribers
+                .entry(self.channel.to_string())
+                .or_insert_with(|| tokio::sync::broadcast::channel(8).0)
+                .subscribe()
+        };
+
+        // Initialize subscription state if needed
+        if subscription_state.is_none() {
+            *subscription_state = Some(SubscriptionState::new());
         }
-        connection
-            .write_frame(Frame::Bulk(Bytes::from(format!(
-                "subscribe {}",
-                self.channel
-            ))))
-            .await?;
-        loop {
-            let bytes = receiver.recv().await?;
-            connection.write_frame(Frame::Bulk(bytes)).await?;
-        }
+
+        // Subscribe to the channel
+        let state = subscription_state.as_mut().unwrap();
+        state.subscribe(self.channel.to_string(), receiver);
+
+        // Return acknowledgment frame
+        Ok(Frame::Array(vec![
+            Frame::Bulk(Bytes::from_static(b"subscribe")),
+            Frame::Bulk(Bytes::copy_from_slice(self.channel.as_bytes())),
+            Frame::Integer(state.count() as i64),
+        ]))
     }
 }

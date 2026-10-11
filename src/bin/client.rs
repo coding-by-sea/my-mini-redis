@@ -19,8 +19,10 @@ enum Command {
     Set { key: String, value: String },
     /// Publish a message to a channel.
     Publish { channel: String, message: String },
-    /// Subscribe to a channel.
-    Subscribe { name: String },
+    /// Subscribe to one or more channels.
+    Subscribe { channels: Vec<String> },
+    /// Unsubscribe from one or more channels (empty = all).
+    Unsubscribe { channels: Vec<String> },
 }
 
 #[tokio::main]
@@ -47,17 +49,36 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
         }
         Command::Publish { channel, message } => {
-            client
+            let recipients = client
                 .publish(&channel, Bytes::from(message))
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            println!("{}", recipients);
         }
-        Command::Subscribe { name } => {
+        Command::Subscribe { channels } => {
+            if channels.is_empty() {
+                anyhow::bail!("at least one channel is required");
+            }
+            let channel_refs: Vec<&str> = channels.iter().map(|s| s.as_str()).collect();
             client
-                .subscribe(&name)
+                .subscribe_multiple(&channel_refs)
                 .await
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
             client.enter_subscribe_mode().await?;
+        }
+        Command::Unsubscribe { channels } => {
+            if channels.is_empty() {
+                client
+                    .unsubscribe_all()
+                    .await
+                    .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            } else {
+                let channel_refs: Vec<&str> = channels.iter().map(|s| s.as_str()).collect();
+                client
+                    .unsubscribe(&channel_refs)
+                    .await
+                    .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            }
         }
     }
 

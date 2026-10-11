@@ -41,9 +41,10 @@ impl Publish {
         let subscriber_count = sender.send(self.message).unwrap_or(0);
 
         connection
-            .write_frame(Frame::Bulk(Bytes::from(format!(
-                "publish {subscriber_count}"
-            ))))
+            .write_frame(Frame::Array(vec![
+                Frame::Bulk(Bytes::from_static(b"publish")),
+                Frame::Integer(subscriber_count as i64),
+            ]))
             .await
     }
 }

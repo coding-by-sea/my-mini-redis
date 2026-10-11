@@ -7,6 +7,9 @@ pub use set::Set;
 mod subscribe;
 pub use subscribe::Subscribe;
 
+mod unsubscribe;
+pub use unsubscribe::Unsubscribe;
+
 mod publish;
 pub use publish::Publish;
 
@@ -18,6 +21,7 @@ pub enum Command {
     Get(Get),
     Set(Set),
     Subscribe(Subscribe),
+    Unsubscribe(Unsubscribe),
     Publish(Publish),
 }
 
@@ -32,6 +36,13 @@ impl Command {
                 parse.next_bytes()?,
             ))),
             "subscribe" => Ok(Command::Subscribe(Subscribe::new(parse.next_string()?))),
+            "unsubscribe" => {
+                let mut channels = Vec::new();
+                while let Ok(channel) = parse.next_string() {
+                    channels.push(channel);
+                }
+                Ok(Command::Unsubscribe(Unsubscribe::new(channels)))
+            }
             "publish" => Ok(Command::Publish(Publish::new(
                 parse.next_string()?,
                 parse.next_bytes()?,

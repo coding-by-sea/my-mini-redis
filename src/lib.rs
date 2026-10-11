@@ -10,6 +10,7 @@ pub mod client;
 pub mod cmd;
 mod parse;
 pub mod server;
+pub mod subscription;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 
