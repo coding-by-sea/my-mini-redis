@@ -279,6 +279,44 @@ export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
 
 ---
 
+## 🚧 Work in Progress
+
+my-mini-redis currently supports 5 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`) over RESP2. The full comparison with Redis (cluster mode excluded) and the roadmap are in the **[gap analysis](https://claude.ai/artifact/NhemL1P9dvxr7bFKskRZbB#3d6c30db-642c)**.
+
+### Current focus: Redis wire compatibility
+
+Several bugs stop standard clients (`redis-cli`, redis-rs, Jedis) from working correctly. Examples:
+
+- Unknown or malformed commands get no reply, so the client hangs
+- `PUBLISH` replies with an array instead of an integer
+- `SUBSCRIBE a b c` only subscribes to the first channel
+- Non-UTF-8 keys or unexpected protocol bytes crash the connection
+
+[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down the expected Redis behavior for each of these bugs with 30 raw-RESP tests; 3 more tests in `src/server.rs` cover pub/sub channel cleanup. **Most of these tests fail on purpose until the fixes land**, so `cargo test` currently reports failures.
+
+The test expectations are themselves checked against a real Redis. All 30 pass against Redis 7.2.5:
+
+```bash
+redis-server --port 47392 --save "" --appendonly no --daemonize yes
+REDIS_COMPAT_TARGET=127.0.0.1:47392 cargo test --test redis_compat
+redis-cli -p 47392 shutdown nosave
+```
+
+> ⚠️ `REDIS_COMPAT_TARGET` mode runs `FLUSHALL` before each test. Only point it at a throwaway server.
+
+### Roadmap
+
+1. **Wire compatibility fixes** — make `tests/redis_compat.rs` pass *(in progress)*
+2. **Basic commands** — `PING`, `ECHO`, `DEL`, `EXISTS`, key expiration and `SET` options
+3. **Typed values** — lists, hashes, sets, sorted sets
+4. **Transactions and persistence** — `MULTI`/`EXEC`, RDB/AOF
+5. **Protocol and security** — RESP3, `AUTH`/ACL, `INFO`, `CONFIG`
+6. **Advanced** — replication, Lua scripting, streams
+
+Design notes and earlier plans are in [`docs/`](docs/).
+
+---
+
 ## 🛡️ Safety & Correctness
 
 ### Test Suite
