@@ -7,7 +7,7 @@
 
 ## 🎯 Technical Elevator Pitch
 
-This project implements a **wire-protocol-compliant Redis server** from scratch in Rust, showcasing expert-level systems programming techniques:
+This project implements a **Redis server speaking the RESP wire protocol** from scratch in Rust (full Redis wire compatibility is [in progress](#-work-in-progress)), showcasing expert-level systems programming techniques:
 
 - **Zero-allocation message forwarding** via `tokio::sync::broadcast` channels and `Bytes` zero-copy buffers
 - **O(1) multi-channel subscription multiplexing** using `StreamMap` for concurrent pub/sub with minimal memory overhead (~184 bytes/channel)
@@ -330,12 +330,16 @@ cargo test -- --nocapture
 
 # Run specific test suite
 cargo test --test cli_integration
+
+# Run only the Redis compatibility tests (most fail until the fixes land)
+cargo test --test redis_compat
 ```
 
 ### Test Coverage
 
-- **8 Unit Tests**: RESP frame encoding/decoding, connection state machines
+- **11 Unit Tests**: RESP frame encoding/decoding, connection state machines, and 3 pub/sub channel-cleanup tests *(cleanup tests currently fail)*
 - **7 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics
+- **30 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, verified against Redis 7.2.5 *(24 currently fail; see [Work in Progress](#-work-in-progress))*
 - **3 CLI Parsing Tests**: Clap argument validation
 
 
@@ -371,7 +375,9 @@ my-mini-redis/
 │   ├── subscription.rs        # Multi-channel subscription state
 │   └── lib.rs                 # Public library interface
 ├── tests/
-│   └── cli_integration.rs     # End-to-end integration tests
+│   ├── cli_integration.rs     # End-to-end integration tests
+│   └── redis_compat.rs        # Redis wire-compatibility tests (raw RESP)
+├── docs/                      # Design notes and implementation plans
 ├── examples/
 │   └── hello-redis.rs         # Example usage
 ├── Cargo.toml                 # Dependency manifest
