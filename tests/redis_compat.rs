@@ -33,7 +33,8 @@
 //! - The in-crate 1.9 tests in `src/server.rs` are not covered; they inspect this
 //!   project's internal state.
 //!
-//! Last checked against Redis 7.2.5: all 30 tests pass.
+//! Last checked against Redis 7.2.5: all 30 tests pass. Sections 1.14 and 1.15 were added
+//! later and have not been checked against a real Redis yet.
 
 use std::future::Future;
 use std::io;
@@ -1048,5 +1049,93 @@ async fn inline_command_with_unbalanced_quotes_is_a_protocol_error() {
     client.assert_closed().await;
 
     RawClient::connect(&address).await.assert_usable().await;
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 1.14 Messages from several channels arrive in publish order
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn messages_from_several_channels_arrive_in_publish_order() {
+    let (address, server) = start_server().await;
+    let mut subscriber = RawClient::connect(&address).await;
+    let mut publisher = RawClient::connect(&address).await;
+
+    subscriber.send(&[b"SUBSCRIBE", b"a"]).await;
+    assert_eq!(subscriber.read().await, push("subscribe", "a", Reply::Integer(1)));
+    subscriber.send(&[b"SUBSCRIBE", b"b"]).await;
+    assert_eq!(subscriber.read().await, push("subscribe", "b", Reply::Integer(2)));
+
+    // Pipeline the publishes in one write so several messages are pending on both
+    // channels at once. Redis delivers them in the order it ran the PUBLISHes.
+    // Kept small (8 per channel) so this checks ordering, not slow subscribers (1.10).
+    const MESSAGES: usize = 16;
+    let message = |i: usize| -> (&'static [u8], Vec<u8>) {
+        let channel: &'static [u8] = if i % 2 == 0 { b"a" } else { b"b" };
+        (channel, i.to_string().into_bytes())
+    };
+    let mut pipeline = Vec::new();
+    for i in 0..MESSAGES {
+        let (channel, payload) = message(i);
+        pipeline.extend(encode(&[b"PUBLISH", channel, &payload]));
+    }
+    publisher.send_raw(&pipeline).await;
+    for _ in 0..MESSAGES {
+        publisher.read().await;
+    }
+
+    for i in 0..MESSAGES {
+        let (channel, payload) = message(i);
+        assert_eq!(
+            subscriber.read().await,
+            push("message", channel, bulk(payload)),
+            "message {i} out of order"
+        );
+    }
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 1.15 A subscriber that falls behind keeps its subscription
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subscriber_that_falls_behind_still_receives_later_messages() {
+    let (address, server) = start_server().await;
+    let mut subscriber = RawClient::connect(&address).await;
+    let mut publisher = RawClient::connect(&address).await;
+
+    assert_eq!(
+        subscriber.cmd(&[b"SUBSCRIBE", b"firehose"]).await,
+        push("subscribe", "firehose", Reply::Integer(1))
+    );
+
+    // ~12.8 MB the subscriber doesn't read yet: enough to fill the socket buffers and
+    // any small per-channel queue, but under Redis's 32 MB pub/sub hard limit and
+    // its 8 MB soft limit's 60 second grace period.
+    const MESSAGES: usize = 400;
+    let payload = vec![b'x'; 32 * 1024];
+    for _ in 0..MESSAGES {
+        publisher.publish(b"firehose", &payload).await;
+    }
+    publisher.publish(b"firehose", b"after").await;
+
+    // Unlike 1.10, losing some of the backlog is tolerated here. What must not happen
+    // is the server dropping the subscription without telling the client, which then
+    // believes it is subscribed but never receives another message.
+    loop {
+        match subscriber.read().await {
+            reply if reply == push("message", "firehose", bulk("after")) => break,
+            Reply::Array(parts) if parts.first() == Some(&bulk("message")) => continue,
+            other => panic!("unexpected reply while draining the backlog: {other:?}"),
+        }
+    }
+
+    subscriber.send(&[b"UNSUBSCRIBE", b"firehose"]).await;
+    assert_eq!(
+        subscriber.read().await,
+        push("unsubscribe", "firehose", Reply::Integer(0))
+    );
     server.abort();
 }

@@ -292,9 +292,9 @@ Several bugs stop standard clients (`redis-cli`, redis-rs, Jedis) from working c
 - `SUBSCRIBE a b c` only subscribes to the first channel
 - Non-UTF-8 keys or unexpected protocol bytes crash the connection
 
-[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down the expected Redis behavior for each of these bugs with 30 raw-RESP tests; 3 more tests in `src/server.rs` cover pub/sub channel cleanup. **Most of these tests fail on purpose until the fixes land**, so `cargo test` currently reports failures.
+[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down the expected Redis behavior for each of these bugs with 32 raw-RESP tests; 3 more tests in `src/server.rs` cover pub/sub channel cleanup. **Most of these tests fail on purpose until the fixes land**, so `cargo test` currently reports failures.
 
-The test expectations are themselves checked against a real Redis. All 30 pass against Redis 7.2.5:
+The test expectations are themselves checked against a real Redis. The first 30 pass against Redis 7.2.5; the two newest (cross-channel message order and lagging subscribers) haven't been checked yet:
 
 ```bash
 redis-server --port 47392 --save "" --appendonly no --daemonize yes
@@ -338,8 +338,8 @@ cargo test --test redis_compat
 ### Test Coverage
 
 - **11 Unit Tests**: RESP frame encoding/decoding, connection state machines, and 3 pub/sub channel-cleanup tests *(cleanup tests currently fail)*
-- **7 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics
-- **30 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, verified against Redis 7.2.5 *(24 currently fail; see [Work in Progress](#-work-in-progress))*
+- **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
+- **32 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, 30 of them verified against Redis 7.2.5 *(26 currently fail; see [Work in Progress](#-work-in-progress))*
 - **3 CLI Parsing Tests**: Clap argument validation
 
 
