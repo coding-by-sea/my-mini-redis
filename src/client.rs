@@ -5,6 +5,7 @@ use crate::frame::Frame;
 use bytes::Bytes;
 use tokio::net::TcpStream;
 use std::collections::HashSet;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 pub struct Client {
     connection: Connection,
@@ -152,15 +153,108 @@ impl Client {
     }
 
     pub async fn enter_subscribe_mode(&mut self) -> anyhow::Result<()> {
-        loop {
-            match self.next_message().await? {
-                Some(message) => println!(
-                    "{}: {}",
-                    message.channel,
-                    String::from_utf8_lossy(&message.payload)
-                ),
-                None => return Ok(()),
+        // Tokio's stdin reads on a blocking-pool thread that the runtime waits for at
+        // shutdown, so a pending read would keep the process alive after this returns.
+        // A detached std thread doesn't block exit; it forwards stdin through a pipe.
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let runtime = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            for line in std::io::stdin().lines() {
+                let Ok(line) = line else { break };
+                let sent = runtime.block_on(async {
+                    writer.write_all(line.as_bytes()).await?;
+                    writer.write_all(b"\n").await
+                });
+                if sent.is_err() {
+                    break;
+                }
             }
+        });
+        self.enter_subscribe_mode_with_input(BufReader::new(reader)).await
+    }
+
+    /// Prints incoming messages while accepting `subscribe <channel>...` and
+    /// `unsubscribe [channel...]` lines from `input`. Returns when the server closes
+    /// the connection or the last subscription is removed.
+    pub async fn enter_subscribe_mode_with_input<R>(&mut self, input: R) -> anyhow::Result<()>
+    where
+        R: AsyncBufRead + Unpin,
+    {
+        let mut lines = input.lines();
+        let mut input_open = true;
+
+        loop {
+            tokio::select! {
+                // Poll commands first so a busy channel can't delay subscribe/unsubscribe.
+                biased;
+
+                line = lines.next_line(), if input_open => match line? {
+                    Some(line) => self.send_subscribe_mode_command(&line).await?,
+                    None => input_open = false,
+                },
+                // `read_frame` only awaits on `read_buf`, so dropping it mid-read loses no data.
+                frame = self.connection.read_frame() => match frame? {
+                    Some(frame) => {
+                        if self.handle_subscribe_mode_frame(frame)? {
+                            return Ok(());
+                        }
+                    }
+                    None => return Ok(()),
+                },
+            }
+        }
+    }
+
+    async fn send_subscribe_mode_command(&mut self, line: &str) -> anyhow::Result<()> {
+        let mut words = line.split_whitespace();
+        let Some(command) = words.next() else {
+            return Ok(());
+        };
+        let channels: Vec<String> = words.map(str::to_string).collect();
+
+        match command.to_ascii_lowercase().as_str() {
+            "subscribe" if !channels.is_empty() => {
+                for channel in channels {
+                    self.connection.write_frame(Subscribe::new(channel).into_frame()).await?;
+                }
+            }
+            "subscribe" => eprintln!("usage: subscribe <channel> [channel...]"),
+            "unsubscribe" => {
+                self.connection.write_frame(Unsubscribe::new(channels).into_frame()).await?;
+            }
+            _ => eprintln!("only subscribe and unsubscribe are allowed in subscribe mode"),
+        }
+        Ok(())
+    }
+
+    /// Returns true once no subscriptions remain.
+    fn handle_subscribe_mode_frame(&mut self, frame: Frame) -> anyhow::Result<bool> {
+        let parts = match frame {
+            Frame::Array(parts) => parts,
+            Frame::Error(err) => anyhow::bail!(err),
+            _ => anyhow::bail!("invalid subscription message"),
+        };
+
+        match parts.as_slice() {
+            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Bulk(payload)] if kind.as_ref() == b"message" => {
+                println!("{}: {}", String::from_utf8_lossy(channel), String::from_utf8_lossy(payload));
+                Ok(false)
+            }
+            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(_)] if kind.as_ref() == b"subscribe" => {
+                let channel = String::from_utf8(channel.to_vec())?;
+                println!("subscribed to {}", channel);
+                self.subscriptions.insert(channel);
+                Ok(false)
+            }
+            // The server reports a count of 0 on every ack of a bare UNSUBSCRIBE, so the
+            // local set decides when the last channel is gone.
+            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(_)] if kind.as_ref() == b"unsubscribe" => {
+                let channel = String::from_utf8_lossy(channel);
+                println!("unsubscribed from {}", channel);
+                self.subscriptions.remove(channel.as_ref());
+                Ok(self.subscriptions.is_empty())
+            }
+            _ => anyhow::bail!("invalid subscription message"),
         }
     }
 }
