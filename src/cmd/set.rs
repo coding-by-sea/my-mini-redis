@@ -1,20 +1,32 @@
-use crate::Db;
-use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
 
 pub struct Set {
-    key: String,
+    key: Bytes,
     value: Bytes,
 }
+
 impl Set {
     pub fn new(key: impl ToString, value: Bytes) -> Self {
         Self {
-            key: key.to_string(),
+            key: Bytes::from(key.to_string()),
             value,
         }
     }
-    pub fn key(&self) -> &str {
+
+    /// Parses `SET key value`; the arity was already checked. No options are
+    /// supported, so any extra argument is a syntax error, as Redis reports for
+    /// an unknown option.
+    pub(crate) fn from_args(mut args: impl Iterator<Item = Bytes>) -> Result<Self, String> {
+        let key = args.next().unwrap();
+        let value = args.next().unwrap();
+        if args.next().is_some() {
+            return Err("ERR syntax error".into());
+        }
+        Ok(Self { key, value })
+    }
+
+    pub fn key(&self) -> &Bytes {
         &self.key
     }
 
@@ -25,17 +37,8 @@ impl Set {
     pub fn into_frame(self) -> Frame {
         Frame::Array(vec![
             Frame::Bulk(Bytes::from_static(b"SET")),
-            Frame::Bulk(Bytes::from(self.key.into_bytes())),
+            Frame::Bulk(self.key),
             Frame::Bulk(self.value),
         ])
-    }
-
-    pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
-        {
-            let mut db = db.lock().unwrap();
-            db.entries.insert(self.key().to_string(), self.value());
-        }
-        let response = Frame::Simple("OK".into());
-        connection.write_frame(response).await
     }
 }

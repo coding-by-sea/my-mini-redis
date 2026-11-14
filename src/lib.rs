@@ -1,22 +1,30 @@
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod connection;
 pub mod frame;
 
 pub mod client;
 pub mod cmd;
-mod parse;
+mod request;
 pub mod server;
 pub mod subscription;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct State {
-    entries: HashMap<String, Bytes>,
-    subscribers: HashMap<String, broadcast::Sender<Bytes>>,
+    entries: HashMap<Bytes, Bytes>,
+    /// Channel -> (connection id -> that connection's queue). A channel is only present
+    /// while it has subscribers.
+    subscribers: HashMap<Bytes, HashMap<u64, subscription::Mailbox>>,
 }
 type Db = Arc<Mutex<State>>;
+
+/// Locks the db. A panic while holding the lock leaves `State` intact (every update is
+/// a single map operation), so poisoning is ignored instead of failing every
+/// connection that comes after.
+fn lock(db: &Db) -> MutexGuard<'_, State> {
+    db.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}

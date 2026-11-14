@@ -84,10 +84,7 @@ impl Frame {
                 }
                 Ok(())
             }
-            actual => unimplemented!(
-                "the protocol is not implemented for first byte {:?}",
-                actual
-            ),
+            _ => Err(Error::InvalidEncoding),
         }
     }
 
@@ -97,12 +94,12 @@ impl Frame {
             // simple string
             b'+' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Simple(String::from_utf8(result).unwrap()))
+                Ok(Frame::Simple(String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?))
             }
             // simple error
             b'-' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Error(String::from_utf8(result).unwrap()))
+                Ok(Frame::Error(String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?))
             }
             // integer
             b':' => Ok(Frame::Integer(Self::get_decimal(bytes)?)),
@@ -137,10 +134,7 @@ impl Frame {
                     Ok(Frame::Array(result))
                 }
             }
-            actual => unimplemented!(
-                "the protocol is not implemented for first byte {:?}",
-                actual
-            ),
+            _ => Err(Error::InvalidEncoding),
         }
     }
 

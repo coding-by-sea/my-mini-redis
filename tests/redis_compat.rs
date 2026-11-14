@@ -2,7 +2,7 @@
 //! gap analysis). Each test talks raw RESP over TCP so it checks the exact bytes a real Redis
 //! client would see, independent of this crate's own `Client`.
 //!
-//! These tests describe the target behavior. Most of them fail until the matching fix lands.
+//! These tests describe Redis's behavior, and this project's server passes all of them.
 //!
 //! # Two ways to run
 //!
@@ -34,7 +34,7 @@
 //!   project's internal state.
 //!
 //! Last checked against Redis 7.2.5: all 30 tests pass. Sections 1.14 and 1.15 were added
-//! later and have not been checked against a real Redis yet.
+//! later and have not been checked against a real Redis yet; neither has 1.16.
 
 use std::future::Future;
 use std::io;
@@ -1137,5 +1137,52 @@ async fn subscriber_that_falls_behind_still_receives_later_messages() {
         subscriber.read().await,
         push("unsubscribe", "firehose", Reply::Integer(0))
     );
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// 1.16 A subscriber far over the output buffer limit is disconnected
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn subscriber_over_the_output_buffer_limit_is_disconnected() {
+    let (address, server) = start_server().await;
+    let mut subscriber = RawClient::connect(&address).await;
+    let mut publisher = RawClient::connect(&address).await;
+
+    assert_eq!(
+        subscriber.cmd(&[b"SUBSCRIBE", b"firehose"]).await,
+        push("subscribe", "firehose", Reply::Integer(1))
+    );
+
+    // 64 MB the subscriber doesn't read: double Redis's 32 MB pub/sub hard limit, so
+    // socket buffers can't absorb the difference. Publishers are never slowed down.
+    const MESSAGES: usize = 2048;
+    let payload = vec![b'x'; 32 * 1024];
+    for _ in 0..MESSAGES {
+        publisher.publish(b"firehose", &payload).await;
+    }
+    publisher.publish(b"firehose", b"after").await;
+
+    // The subscriber gets whatever was sent before the cut, then the connection closes.
+    let mut received = 0;
+    loop {
+        match timeout(REPLY_TIMEOUT, read_reply(&mut subscriber.reader)).await {
+            Ok(Ok(reply)) => {
+                assert_ne!(
+                    reply,
+                    push("message", "firehose", bulk("after")),
+                    "subscriber was never disconnected"
+                );
+                received += 1;
+            }
+            Ok(Err(_)) => break, // EOF or reset: disconnected
+            Err(_) => panic!("subscriber neither disconnected nor sent more after {received} messages"),
+        }
+    }
+    assert!(received < MESSAGES, "every message arrived, so nothing was cut off");
+
+    // The server and other clients are unaffected.
+    publisher.assert_usable().await;
     server.abort();
 }

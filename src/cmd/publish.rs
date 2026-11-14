@@ -1,50 +1,40 @@
+use crate::frame::Frame;
 use bytes::Bytes;
 
-use crate::Db;
-use crate::connection::Connection;
-use crate::frame::Frame;
-use tokio::sync::broadcast;
-
 pub struct Publish {
-    channel: String,
+    channel: Bytes,
     message: Bytes,
 }
 
 impl Publish {
     pub fn new(channel: impl ToString, message: Bytes) -> Self {
         Self {
-            channel: channel.to_string(),
+            channel: Bytes::from(channel.to_string()),
             message,
         }
     }
 
-    pub fn channel(&self) -> &str {
+    /// Parses `PUBLISH channel message`; the arity was already checked.
+    pub(crate) fn from_args(mut args: impl Iterator<Item = Bytes>) -> Self {
+        Self {
+            channel: args.next().unwrap(),
+            message: args.next().unwrap(),
+        }
+    }
+
+    pub fn channel(&self) -> &Bytes {
         &self.channel
+    }
+
+    pub fn message(&self) -> &Bytes {
+        &self.message
     }
 
     pub fn into_frame(self) -> Frame {
         Frame::Array(vec![
             Frame::Bulk(Bytes::from_static(b"PUBLISH")),
-            Frame::Bulk(Bytes::from(self.channel.into_bytes())),
+            Frame::Bulk(self.channel),
             Frame::Bulk(self.message),
         ])
-    }
-
-    pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
-        let sender = {
-            let mut db = db.lock().unwrap();
-            db.subscribers
-                .entry(self.channel.clone())
-                .or_insert_with(|| broadcast::channel(8).0)
-                .clone()
-        };
-        let subscriber_count = sender.send(self.message).unwrap_or(0);
-
-        connection
-            .write_frame(Frame::Array(vec![
-                Frame::Bulk(Bytes::from_static(b"publish")),
-                Frame::Integer(subscriber_count as i64),
-            ]))
-            .await
     }
 }

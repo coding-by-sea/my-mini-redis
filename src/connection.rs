@@ -1,7 +1,8 @@
 use super::frame::Error as FrameError;
 use super::frame::Frame;
+use super::request::{self, Parsed, ProtocolError};
 use anyhow;
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use std::io::{Cursor, Error, ErrorKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
@@ -9,6 +10,13 @@ use tokio::net::TcpStream;
 pub struct Connection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
+}
+
+pub(crate) enum ReadRequestError {
+    /// The client sent bytes that aren't a valid request. Reply, then close.
+    Protocol(ProtocolError),
+    /// The connection itself failed.
+    Io(anyhow::Error),
 }
 
 impl Connection {
@@ -31,6 +39,34 @@ impl Connection {
                 } else {
                     Err(Error::from(ErrorKind::ConnectionReset).into())
                 };
+            }
+        }
+    }
+
+    /// Reads the next client request (server side). Returns `Ok(None)` once the client
+    /// closes the connection. Requests Redis ignores, such as empty arrays, are skipped.
+    ///
+    /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
+    pub(crate) async fn read_request(&mut self) -> Result<Option<Vec<Bytes>>, ReadRequestError> {
+        loop {
+            match request::parse(&self.buffer).map_err(ReadRequestError::Protocol)? {
+                Parsed::Request { args, consumed } => {
+                    self.buffer.advance(consumed);
+                    if !args.is_empty() {
+                        return Ok(Some(args));
+                    }
+                    continue;
+                }
+                Parsed::Incomplete => {}
+            }
+            let read = self
+                .stream
+                .read_buf(&mut self.buffer)
+                .await
+                .map_err(|error| ReadRequestError::Io(error.into()))?;
+            if read == 0 {
+                // A request cut off by the client closing has nobody left to answer.
+                return Ok(None);
             }
         }
     }

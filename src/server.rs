@@ -1,10 +1,16 @@
-use crate::cmd::Command::{self, Get, Publish, Set, Subscribe, Unsubscribe};
-use crate::connection::Connection;
-use crate::subscription::SubscriptionState;
+use crate::cmd::Command;
+use crate::connection::{Connection, ReadRequestError};
 use crate::frame::Frame;
-use crate::{Db, DEFAULT_ADDRESS};
+use crate::request::ProtocolError;
+use crate::subscription::{self, Message, QUEUE_LIMIT_BYTES, Subscriptions};
+use crate::{DEFAULT_ADDRESS, Db, lock};
 use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::{Duration, sleep};
+
+/// How long to wait before accepting again after `accept` fails, for example because
+/// the process ran out of file descriptors and must wait for connections to close.
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub struct Server {
     db: Db,
@@ -22,101 +28,194 @@ impl Server {
 
     pub async fn run_with_listener(&mut self, listener: TcpListener) {
         loop {
-            let (socket, _) = listener.accept().await.unwrap();
+            let socket = match listener.accept().await {
+                Ok((socket, _)) => socket,
+                Err(error) => {
+                    eprintln!("ERROR accepting connection: {error}");
+                    sleep(ACCEPT_RETRY_DELAY).await;
+                    continue;
+                }
+            };
             let db = self.db.clone();
             tokio::spawn(async move {
-                Server::handle(socket, db).await;
+                if let Err(error) = Server::handle(socket, db).await {
+                    eprintln!("ERROR on connection: {error:#}");
+                }
             });
         }
     }
 
-    async fn handle(socket: TcpStream, db: Db) {
+    /// Serves one connection until the client leaves. Mistakes in a request get an
+    /// error reply and the connection stays open; malformed RESP gets a protocol
+    /// error and closes the connection; I/O failures close it and are returned.
+    async fn handle(socket: TcpStream, db: Db) -> anyhow::Result<()> {
         let mut connection = Connection::new(socket);
-        let mut subscription_state: Option<SubscriptionState> = None;
+        let mut session = Session::new(db);
+        let overflow = session.subscriptions.overflow_signal();
 
         loop {
             tokio::select! {
-                // Read commands from client
-                frame_result = connection.read_frame() => {
-                    match frame_result {
-                        Ok(Some(frame)) => {
-                            println!("GOT: {:?}", frame);
-
-                            let result = match Command::from_frame(frame) {
-                                Ok(Subscribe(cmd)) => {
-                                    match cmd.apply(db.clone(), &mut connection, &mut subscription_state).await {
-                                        Ok(response) => connection.write_frame(response).await,
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Ok(Unsubscribe(cmd)) => {
-                                    match cmd.apply(&mut connection, &mut subscription_state).await {
-                                        Ok(responses) => {
-                                            let mut result = Ok(());
-                                            for response in responses {
-                                                if let Err(e) = connection.write_frame(response).await {
-                                                    result = Err(e);
-                                                    break;
-                                                }
-                                            }
-                                            result
-                                        }
-                                        Err(e) => Err(e),
-                                    }
-                                }
-                                Ok(Set(cmd)) => cmd.apply(db.clone(), &mut connection).await,
-                                Ok(Get(cmd)) => cmd.apply(db.clone(), &mut connection).await,
-                                Ok(Publish(cmd)) => cmd.apply(db.clone(), &mut connection).await,
-                                Err(e) => {
-                                    println!("ERROR parsing command: {:?}", e);
-                                    Err(e)
-                                }
-                            };
-
-                            if let Err(e) = result {
-                                println!("ERROR: {:?}", e);
-                            }
+                request = connection.read_request() => {
+                    let args = match request {
+                        Ok(Some(args)) => args,
+                        Ok(None) => return Ok(()),
+                        Err(ReadRequestError::Protocol(ProtocolError(message))) => {
+                            connection
+                                .write_frame(error_frame(format!("ERR Protocol error: {message}")))
+                                .await?;
+                            return Ok(());
                         }
-                        Ok(None) => {
-                            // Connection closed
-                            break;
-                        }
-                        Err(e) => {
-                            println!("ERROR reading frame: {:?}", e);
-                            break;
-                        }
+                        Err(ReadRequestError::Io(error)) => return Err(error),
+                    };
+                    let (replies, next) = session.execute(args);
+                    for reply in replies {
+                        connection.write_frame(reply).await?;
+                    }
+                    if let Next::Close = next {
+                        return Ok(());
                     }
                 }
-
-                // Forward messages from subscribed channels (conditional select)
-                msg = async {
-                    match subscription_state.as_mut() {
-                        Some(state) if !state.is_empty() => state.next_message().await,
-                        _ => None,
-                    }
-                }, if subscription_state.as_ref().map(|s| !s.is_empty()).unwrap_or(false) => {
-                    match msg {
-                        Some((channel, payload)) => {
-                            let result = connection.write_frame(Frame::Array(vec![
-                                Frame::Bulk(Bytes::from_static(b"message")),
-                                Frame::Bulk(Bytes::from(channel)),
-                                Frame::Bulk(payload),
-                            ])).await;
-
-                            if let Err(e) = result {
-                                println!("ERROR writing message: {:?}", e);
-                                break;
-                            }
-                        }
-                        None => {
-                            // All channels closed
-                            break;
-                        }
-                    }
+                message = session.subscriptions.next_message() => {
+                    connection.write_frame(message_frame(message)).await?;
+                }
+                () = overflow.wait() => {
+                    anyhow::bail!(
+                        "closed subscriber: over {} MB of messages queued",
+                        QUEUE_LIMIT_BYTES / (1024 * 1024)
+                    );
                 }
             }
         }
     }
+}
+
+enum Next {
+    Continue,
+    Close,
+}
+
+/// A connection's state. Dropping it, however the connection ends, removes the
+/// connection's subscriptions from the db.
+struct Session {
+    db: Db,
+    subscriptions: Subscriptions,
+}
+
+impl Session {
+    fn new(db: Db) -> Self {
+        Self {
+            db,
+            subscriptions: Subscriptions::new(),
+        }
+    }
+
+    /// Runs one request and returns the frames to send, in order.
+    fn execute(&mut self, args: Vec<Bytes>) -> (Vec<Frame>, Next) {
+        let mut state = lock(&self.db);
+        // Messages published before this command go out before its reply, as in Redis.
+        // Taking them under the lock means none can slip in between.
+        let mut replies: Vec<Frame> = self
+            .subscriptions
+            .take_queued()
+            .into_iter()
+            .map(message_frame)
+            .collect();
+
+        let command = match Command::from_args(args) {
+            Ok(command) => command,
+            Err(message) => {
+                replies.push(error_frame(message));
+                return (replies, Next::Continue);
+            }
+        };
+        if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
+            replies.push(error_frame(format!(
+                "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
+                command.name()
+            )));
+            return (replies, Next::Continue);
+        }
+
+        match command {
+            Command::Get(cmd) => {
+                replies.push(state.entries.get(cmd.key()).cloned().map_or(Frame::Null, Frame::Bulk));
+            }
+            Command::Set(cmd) => {
+                state.entries.insert(cmd.key().clone(), cmd.value());
+                replies.push(Frame::Simple("OK".into()));
+            }
+            Command::Publish(cmd) => {
+                let receivers = subscription::publish(&state, cmd.channel(), cmd.message());
+                replies.push(Frame::Integer(receivers as i64));
+            }
+            Command::Subscribe(cmd) => {
+                for channel in cmd.channels() {
+                    self.subscriptions.subscribe(&mut state, channel.clone());
+                    replies.push(push_frame("subscribe", Frame::Bulk(channel.clone()), self.subscriptions.count()));
+                }
+            }
+            Command::Unsubscribe(cmd) => {
+                let channels = if cmd.channels().is_empty() {
+                    self.subscriptions.channels()
+                } else {
+                    cmd.channels().to_vec()
+                };
+                if channels.is_empty() {
+                    replies.push(push_frame("unsubscribe", Frame::Null, 0));
+                }
+                for channel in channels {
+                    self.subscriptions.unsubscribe(&mut state, &channel);
+                    replies.push(push_frame("unsubscribe", Frame::Bulk(channel), self.subscriptions.count()));
+                }
+            }
+            Command::Ping(message) => replies.push(if self.subscriptions.is_empty() {
+                message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
+            } else {
+                Frame::Array(vec![
+                    Frame::Bulk(Bytes::from_static(b"pong")),
+                    Frame::Bulk(message.unwrap_or_default()),
+                ])
+            }),
+            Command::Quit => {
+                replies.push(Frame::Simple("OK".into()));
+                return (replies, Next::Close);
+            }
+            Command::Reset => {
+                self.subscriptions.unsubscribe_all(&mut state);
+                replies.push(Frame::Simple("RESET".into()));
+            }
+        }
+        (replies, Next::Continue)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        let mut state = lock(&self.db);
+        self.subscriptions.unsubscribe_all(&mut state);
+    }
+}
+
+/// An error reply. Redis replaces CR and LF with spaces, since an error is one line.
+fn error_frame(message: String) -> Frame {
+    Frame::Error(message.replace(['\r', '\n'], " "))
+}
+
+/// A pub/sub reply such as `[subscribe, channel, count]`.
+fn push_frame(kind: &'static str, channel: Frame, count: usize) -> Frame {
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(kind.as_bytes())),
+        channel,
+        Frame::Integer(count as i64),
+    ])
+}
+
+fn message_frame((channel, payload): Message) -> Frame {
+    Frame::Array(vec![
+        Frame::Bulk(Bytes::from_static(b"message")),
+        Frame::Bulk(channel),
+        Frame::Bulk(payload),
+    ])
 }
 
 #[cfg(test)]
