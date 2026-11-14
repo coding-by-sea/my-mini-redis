@@ -108,6 +108,9 @@ impl Drop for TestServer {
     }
 }
 
+// Against a real Redis, the returned guard is held for the whole test on purpose, so
+// tests that share key and channel names run one at a time.
+#[allow(clippy::await_holding_lock)]
 async fn start_server() -> (String, TestServer) {
     if let Some(address) = external_target() {
         static SERIAL: Mutex<()> = Mutex::new(());
@@ -1072,7 +1075,7 @@ async fn messages_from_several_channels_arrive_in_publish_order() {
     // Kept small (8 per channel) so this checks ordering, not slow subscribers (1.10).
     const MESSAGES: usize = 16;
     let message = |i: usize| -> (&'static [u8], Vec<u8>) {
-        let channel: &'static [u8] = if i % 2 == 0 { b"a" } else { b"b" };
+        let channel: &'static [u8] = if i.is_multiple_of(2) { b"a" } else { b"b" };
         (channel, i.to_string().into_bytes())
     };
     let mut pipeline = Vec::new();

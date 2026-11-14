@@ -16,6 +16,12 @@ pub struct Server {
     db: Db,
 }
 
+impl Default for Server {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Server {
     pub fn new() -> Self {
         Self { db: Db::default() }
