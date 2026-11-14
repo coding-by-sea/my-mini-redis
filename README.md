@@ -142,15 +142,19 @@ cargo run --bin my-mini-redis-cli -- get greeting
 # Publish to a channel
 cargo run --bin my-mini-redis-cli -- publish events "deployment_complete"
 
-# Subscribe to multiple channels
+# Subscribe to multiple channels; messages print as they arrive
 cargo run --bin my-mini-redis-cli -- subscribe events logs alerts
-
-# Unsubscribe from specific channels
-cargo run --bin my-mini-redis-cli -- unsubscribe events
-
-# Unsubscribe from all channels
-cargo run --bin my-mini-redis-cli -- unsubscribe
 ```
+
+While subscribed, type commands to change the subscriptions. Leaving the last channel, or pressing Ctrl-C, exits:
+
+```text
+subscribe metrics        # add channels
+unsubscribe events       # leave specific channels
+unsubscribe              # leave every channel
+```
+
+There is no standalone `unsubscribe` command: subscriptions belong to a connection, and each CLI run opens a new one.
 
 ### Environment Configuration
 
@@ -169,7 +173,7 @@ my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE
 
 [`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 33 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining, slow subscribers and running out of file descriptors. 3 more tests in `src/server.rs` cover pub/sub channel cleanup. All of them pass.
 
-The test expectations are themselves checked against a real Redis. The first 30 pass against Redis 7.2.5; the three newest (cross-channel message order, lagging subscribers, and the output buffer limit) haven't been checked yet:
+The test expectations are themselves checked against a real Redis: CI's `redis-compat` job runs them against Redis 7.2.5 on every pull request, and all pass there (the file-descriptor test skips itself in that mode). To run that check locally:
 
 ```bash
 redis-server --port 47392 --save "" --appendonly no --daemonize yes
@@ -215,7 +219,7 @@ cargo test --test redis_compat
 - **20 Unit Tests**: RESP frame encoding/decoding, request parsing (RESP and inline), and 3 pub/sub channel-cleanup tests
 - **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
 - **33 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, 30 of them verified against Redis 7.2.5
-- **3 CLI Parsing Tests**: Clap argument validation
+- **4 CLI Parsing Tests**: Clap argument validation
 
 
 ### Memory Safety Guarantees

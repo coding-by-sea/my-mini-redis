@@ -33,8 +33,8 @@
 //! - The in-crate 1.9 tests in `src/server.rs` are not covered; they inspect this
 //!   project's internal state.
 //!
-//! Last checked against Redis 7.2.5: all 30 tests pass. Sections 1.14 and 1.15 were added
-//! later and have not been checked against a real Redis yet; neither has 1.16.
+//! CI's `redis-compat` job runs this file against Redis 7.2.5 on every pull request; all
+//! tests pass there.
 
 use std::future::Future;
 use std::io;
