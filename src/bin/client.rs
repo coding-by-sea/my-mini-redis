@@ -19,10 +19,10 @@ enum Command {
     Set { key: String, value: String },
     /// Publish a message to a channel.
     Publish { channel: String, message: String },
-    /// Subscribe to one or more channels.
+    /// Subscribe to one or more channels, then print messages as they arrive.
+    /// While subscribed, type `subscribe <channel>...` or `unsubscribe [channel...]`
+    /// to change subscriptions; leaving the last channel (or Ctrl-C) exits.
     Subscribe { channels: Vec<String> },
-    /// Unsubscribe from one or more channels (empty = all).
-    Unsubscribe { channels: Vec<String> },
 }
 
 #[tokio::main]
@@ -66,20 +66,6 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|error| anyhow::Error::msg(error.to_string()))?;
             client.enter_subscribe_mode().await?;
         }
-        Command::Unsubscribe { channels } => {
-            if channels.is_empty() {
-                client
-                    .unsubscribe_all()
-                    .await
-                    .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-            } else {
-                let channel_refs: Vec<&str> = channels.iter().map(|s| s.as_str()).collect();
-                client
-                    .unsubscribe(&channel_refs)
-                    .await
-                    .map_err(|error| anyhow::Error::msg(error.to_string()))?;
-            }
-        }
     }
 
     Ok(())
@@ -111,5 +97,11 @@ mod tests {
         assert!(
             matches!(cli.command, Command::Publish { channel, message } if channel == "events" && message == "created")
         );
+    }
+
+    #[test]
+    fn has_no_standalone_unsubscribe() {
+        // Subscriptions belong to a connection, and each CLI run opens a new one.
+        assert!(Cli::try_parse_from(["client", "unsubscribe", "events"]).is_err());
     }
 }

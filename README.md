@@ -142,15 +142,19 @@ cargo run --bin my-mini-redis-cli -- get greeting
 # Publish to a channel
 cargo run --bin my-mini-redis-cli -- publish events "deployment_complete"
 
-# Subscribe to multiple channels
+# Subscribe to multiple channels; messages print as they arrive
 cargo run --bin my-mini-redis-cli -- subscribe events logs alerts
-
-# Unsubscribe from specific channels
-cargo run --bin my-mini-redis-cli -- unsubscribe events
-
-# Unsubscribe from all channels
-cargo run --bin my-mini-redis-cli -- unsubscribe
 ```
+
+While subscribed, type commands to change the subscriptions. Leaving the last channel, or pressing Ctrl-C, exits:
+
+```text
+subscribe metrics        # add channels
+unsubscribe events       # leave specific channels
+unsubscribe              # leave every channel
+```
+
+There is no standalone `unsubscribe` command: subscriptions belong to a connection, and each CLI run opens a new one.
 
 ### Environment Configuration
 
@@ -215,7 +219,7 @@ cargo test --test redis_compat
 - **20 Unit Tests**: RESP frame encoding/decoding, request parsing (RESP and inline), and 3 pub/sub channel-cleanup tests
 - **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
 - **33 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, 30 of them verified against Redis 7.2.5
-- **3 CLI Parsing Tests**: Clap argument validation
+- **4 CLI Parsing Tests**: Clap argument validation
 
 
 ### Memory Safety Guarantees
