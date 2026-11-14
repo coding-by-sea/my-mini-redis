@@ -7,18 +7,17 @@
 
 ## 🎯 Technical Elevator Pitch
 
-This project implements a **Redis server speaking the RESP wire protocol** from scratch in Rust (full Redis wire compatibility is [in progress](#-work-in-progress)), showcasing expert-level systems programming techniques:
+This project implements a **Redis server speaking the RESP2 wire protocol** from scratch in Rust, wire-compatible with Redis for the commands it supports (`GET`, `SET` without options, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`):
 
-- **Zero-allocation message forwarding** via `tokio::sync::broadcast` channels and `Bytes` zero-copy buffers
-- **O(1) multi-channel subscription multiplexing** using `StreamMap` for concurrent pub/sub with minimal memory overhead (~184 bytes/channel)
-- **Type-safe command dispatch** with compile-time protocol validation through Rust's enum exhaustiveness checking
-- **Async connection pooling** with `tokio::select!` for non-blocking I/O across heterogeneous workloads (GET/SET + pub/sub)
-- **RESP (REdis Serialization Protocol)** parser hand-optimized for allocation-free streaming decoding
+- **Ordered pub/sub delivery**: one queue per connection, filled under the db lock, so messages from every channel arrive in publish order
+- **Slow subscribers never block publishers**: messages queue up to Redis's 32 MB pub/sub limit, then the subscriber is disconnected
+- **Redis-compatible request parsing**: RESP arrays and inline commands, with Redis's exact error replies
+- **Binary-safe keys, values and channel names** using `Bytes` zero-copy buffers
+- **Async connection handling** with `tokio::select!` across commands and pub/sub messages
 
 Key Technics:
 - Async runtime internals (Tokio)
 - Zero-copy buffer management (`Bytes`, `BytesMut`)
-- Lock-free broadcast patterns (MPMC channels)
 - Connection-oriented state machines
 - Network protocol design and wire-format parsing
 
@@ -31,212 +30,95 @@ Key Technics:
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         Client Layer                             │
-│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
-│  │  Publisher   │    │  Subscriber  │    │  Key-Value   │      │
-│  │   Client     │    │    Client    │    │    Client    │      │
-│  └──────┬───────┘    └──────┬───────┘    └──────┬───────┘      │
-│         │                   │                    │               │
-└─────────┼───────────────────┼────────────────────┼───────────────┘
-          │                   │                    │
-          │   RESP Protocol   │                    │
-          │   (TCP Stream)    │                    │
-          ▼                   ▼                    ▼
+│   Publisher / Subscriber / Key-Value clients, redis-cli, ...     │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │ RESP2 or inline commands (TCP)
+                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                       Server Layer (Tokio)                       │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │           Connection Handler (per-connection task)        │  │
 │  │                                                           │  │
-│  │   ┌──────────────┐          ┌────────────────────┐      │  │
-│  │   │  RESP Parser │──────────▶  Command Dispatch  │      │  │
-│  │   │ (frame.rs)   │          │   (cmd::apply)     │      │  │
-│  │   └──────────────┘          └─────────┬──────────┘      │  │
-│  │                                       │                  │  │
-│  │   tokio::select! {                    │                  │  │
-│  │     connection.read_frame() ──────────┘                  │  │
-│  │     subscription_state.next_message() ────────┐          │  │
-│  │   }                                           │          │  │
-│  └───────────────────────────────────────────────┼──────────┘  │
-│                                                  │              │
-│  ┌────────────────────────────────────────────────────────┐   │
-│  │              Shared State (Arc<Mutex<Db>>)             │   │
-│  │  ┌──────────────────┐    ┌──────────────────────────┐ │   │
-│  │  │   Key-Value      │    │  Broadcast Channels      │ │   │
-│  │  │   HashMap        │    │  (pub/sub routing)       │ │   │
-│  │  │  <String, Bytes> │    │  HashMap<String, Sender> │ │   │
-│  │  └──────────────────┘    └──────────────────────────┘ │   │
-│  └────────────────────────────────────────────────────────┘   │
+│  │   tokio::select! {                                        │  │
+│  │     connection.read_request()   ─▶ Session::execute()     │  │
+│  │     subscriptions.next_message() ─▶ write "message" push  │  │
+│  │     overflow.wait()              ─▶ disconnect (>32 MB)   │  │
+│  │   }                                                       │  │
+│  └───────────────────────────────────┬───────────────────────┘  │
+│                                      │ lock                     │
+│  ┌───────────────────────────────────▼───────────────────────┐  │
+│  │              Shared State (Arc<Mutex<State>>)              │  │
+│  │   entries:     HashMap<Bytes, Bytes>                       │  │
+│  │   subscribers: HashMap<channel, HashMap<conn id, Mailbox>> │  │
+│  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
-          │                                     │
-          │  Tokio Broadcast (MPMC)            │
-          │  Zero-copy forwarding              │
-          ▼                                     ▼
-┌─────────────────────┐            ┌────────────────────────┐
-│ Per-Connection      │            │  StreamMap<String,     │
-│ SubscriptionState   │◀───────────│  BroadcastStream>      │
-│ (StreamMap)         │            │  (O(n) polling)        │
-└─────────────────────┘            └────────────────────────┘
+        PUBLISH appends (channel, payload) to each subscriber's
+        Mailbox: an unbounded per-connection queue with a byte limit
 ```
 
 ### Key Architectural Decisions
 
-1. **Connection Multiplexing**: Each TCP connection spawns a dedicated `tokio::task` with a `select!` macro that concurrently polls:
-   - Incoming commands (RESP frames from the client)
-   - Subscribed channel messages (from `StreamMap` of broadcast receivers)
+1. **One queue per connection**: `PUBLISH` appends to every subscriber's queue while holding the db lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
 
-2. **Lock-Free Message Passing**: Publish operations use `tokio::sync::broadcast::Sender::send()`, which is lock-free for MPMC (multi-producer, multi-consumer) scenarios. Subscribers hold `Receiver` clones wrapped in `BroadcastStream` for async iteration.
+2. **Replies and messages stay in order**: before running a command, the connection takes the messages already queued (under the same lock) and sends them first. A message published before an `UNSUBSCRIBE` arrives before its acknowledgment, exactly as in Redis.
 
-3. **Zero-Copy Buffer Management**: `Bytes` from the `bytes` crate provides reference-counted, immutable byte slices. Messages are cloned via `Arc` pointer increments, not memcpy.
+3. **Bounded memory without backpressure**: queues never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
 
-4. **Type-Safe Command Dispatch**: The `Command` enum ensures exhaustive pattern matching at compile time. Each variant (`Get`, `Set`, `Publish`, `Subscribe`, `Unsubscribe`) owns its data and implements an `apply()` method with protocol-specific logic encapsulated within the command struct.
+4. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+
+5. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
 
 ---
 
-## 🦀 Rust Design Patterns & Expertise Showcase
+## 🦀 Rust Design Patterns
 
-### 1. **Ownership & Zero-Copy Semantics**
-
-```rust
-// src/cmd/publish.rs
-pub(crate) async fn apply(self, db: Db, connection: &mut Connection) -> anyhow::Result<()> {
-    let sender = {
-        let mut db = db.lock().unwrap();
-        db.subscribers
-            .entry(self.channel.clone())
-            .or_insert_with(|| broadcast::channel(8).0)
-            .clone()  // Clone Sender (cheap Arc increment)
-    };
-    
-    // Zero-copy send: message is Arc-wrapped internally by broadcast channel
-    let subscriber_count = sender.send(self.message).unwrap_or(0);
-    
-    connection.write_frame(Frame::Array(vec![
-        Frame::Bulk(Bytes::from_static(b"publish")),
-        Frame::Integer(subscriber_count as i64),
-    ])).await
-}
-```
-
-**Why this matters**: The `Bytes` type and `broadcast::Sender` ensure that even with hundreds of subscribers, the message payload is never copied—only reference counts are incremented. This is critical for high-throughput pub/sub workloads.
-
-### 2. **Lifetime-Driven State Machines**
+### 1. **Ordered, non-blocking fan-out**
 
 ```rust
 // src/subscription.rs
-pub struct SubscriptionState {
-    streams: StreamMap<String, BroadcastStream<Bytes>>,
-    subscription_count: usize,
-}
-
-impl SubscriptionState {
-    pub async fn next_message(&mut self) -> Option<(String, Bytes)> {
-        loop {
-            match self.streams.next().await {
-                Some((channel, Ok(msg))) => return Some((channel, msg)),
-                Some((channel, Err(_))) => {
-                    self.streams.remove(&channel);  // RAII-style cleanup
-                    continue;
-                }
-                None => return None,  // All channels closed
-            }
-        }
+pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes) -> usize {
+    let Some(subscribers) = state.subscribers.get(channel) else {
+        return 0;
+    };
+    for mailbox in subscribers.values() {
+        mailbox.deliver(channel, payload);
     }
+    subscribers.len()
 }
 ```
 
-**Design principle**: `SubscriptionState` holds mutable references to async streams with explicit lifetimes tracked by the compiler. When a stream errors (lagged or closed), RAII ensures automatic cleanup without manual resource tracking.
+`deliver` pushes onto an unbounded `mpsc` queue, so it never waits. `Bytes` clones are reference-count increments, so a payload is never copied per subscriber.
 
-### 3. **Conditional Select Branches (Advanced Async)**
+### 2. **Cancel-safe `select!`**
 
 ```rust
 // src/server.rs
 tokio::select! {
-    frame_result = connection.read_frame() => { /* handle commands */ }
-    
-    // Conditional branch: only polled when subscriptions exist
-    msg = async {
-        match subscription_state.as_mut() {
-            Some(state) if !state.is_empty() => state.next_message().await,
-            _ => None,
-        }
-    }, if subscription_state.as_ref().map(|s| !s.is_empty()).unwrap_or(false) => {
-        // Forward message to client
-    }
+    request = connection.read_request() => { /* execute, write replies */ }
+    message = session.subscriptions.next_message() => { /* write message */ }
+    () = overflow.wait() => { /* disconnect */ }
 }
 ```
 
-**Performance win**: The `if` guard prevents unnecessary polling of empty `StreamMap` instances, reducing CPU overhead when clients have no active subscriptions. This is a **zero-cost abstraction**—the compiler elides the branch entirely when the condition is statically false.
+Every branch is cancel safe: `read_request` only awaits `read_buf`, `mpsc::recv` loses nothing when dropped, and `Notify` keeps a signal sent while nobody waits.
 
-### 4. **Error Propagation Without Allocations**
-
-```rust
-// src/parse.rs
-pub(crate) fn next_string(&mut self) -> ParseResult<String> {
-    match self.next()? {
-        Frame::Simple(s) => Ok(String::from_utf8(s.to_vec())?),
-        Frame::Bulk(bytes) => Ok(String::from_utf8(bytes.to_vec())?),
-        _ => Err(anyhow!("expected string frame")),
-    }
-}
-```
-
-**Pattern**: Using `anyhow::Result` with the `?` operator avoids manual `match` boilerplate while preserving zero-cost unwinding via Rust's panic infrastructure (no heap allocation for error paths).
-
-### 5. **Type-Safe Protocol Validation**
+### 3. **Redis-compatible errors**
 
 ```rust
 // src/cmd/mod.rs
-pub enum Command {
-    Get(Get),
-    Set(Set),
-    Subscribe(Subscribe),
-    Unsubscribe(Unsubscribe),
-    Publish(Publish),
-}
-
-impl Command {
-    pub fn from_frame(frame: Frame) -> anyhow::Result<Command> {
-        let mut parse = Parse::new(frame)?;
-        let string = parse.next_string()?;
-        match string.to_lowercase().as_str() {
-            "get" => Ok(Command::Get(Get::new(parse.next_string()?))),
-            "set" => Ok(Command::Set(Set::new(parse.next_string()?, parse.next_bytes()?))),
-            "subscribe" => Ok(Command::Subscribe(Subscribe::new(parse.next_string()?))),
-            "unsubscribe" => { /* parse multiple channels */ }
-            "publish" => Ok(Command::Publish(Publish::new(parse.next_string()?, parse.next_bytes()?))),
-            _ => Err(anyhow!("unknown command: {}", string)),
-        }
-    }
-}
+let arity: i32 = match name.as_slice() {
+    b"get" => 2,
+    b"set" => -3,
+    b"publish" => 3,
+    b"subscribe" => -2,
+    // ...
+    _ => return Err(unknown_command(&args)),
+};
 ```
 
-**Compile-time safety**: The exhaustive `match` ensures all command variants are handled. Adding a new command requires updating this dispatch logic, preventing runtime surprises.
+Commands are checked against Redis's arity table, and errors use Redis's exact text (`ERR unknown command 'FOOBAR', with args beginning with: ...`, `ERR wrong number of arguments for 'get' command`), so client libraries behave as they would against Redis.
 
 ---
-
-## ⚡ Advanced Key Features
-
-### **Tier 1: Core Infrastructure**
-
-- **RESP Wire Protocol Parser**: Hand-rolled streaming parser with backpressure-aware buffering (`Connection::read_frame`)
-- **Async Connection Pool**: Tokio-based task spawning with `Arc<Mutex<Db>>` for shared state
-- **Zero-Allocation Command Routing**: Enum-based dispatch with move semantics (no heap allocations per command)
-
-### **Tier 2: Pub/Sub System**
-
-- **Multi-Channel Subscription Multiplexing**: `StreamMap` provides O(n) polling over multiple broadcast receivers (n = active subscriptions per connection)
-- **Lock-Free Broadcast Channels**: `tokio::sync::broadcast` for MPMC message distribution with configurable lag tolerance
-- **Idempotent Subscribe/Unsubscribe**: HashSet-based deduplication prevents duplicate subscriptions
-- **Graceful Lagged Subscriber Handling**: Automatic stream removal on `RecvError::Lagged` to prevent head-of-line blocking
-
-### **Tier 3: Advanced Optimizations**
-
-- **Conditional Select Polling**: Async branches disabled at runtime when no subscriptions exist (zero syscall overhead)
-- **Command Pattern with Move Semantics**: Each command owns its data and implements a consistent `apply(self, ...)` interface
-- **Bytes Zero-Copy Buffers**: All payloads use `Bytes` reference-counted slices (no memcpy on clone)
-- **StreamMap Memory Efficiency**: ~184 bytes per subscription vs. ~8KB+ for task-per-channel alternatives
-
----
-
 
 ### Running the Server
 
@@ -281,20 +163,13 @@ export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
 
 ## 🚧 Work in Progress
 
-my-mini-redis currently supports 5 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`) over RESP2. The full comparison with Redis (cluster mode excluded) and the roadmap are in the **[gap analysis](https://claude.ai/artifact/NhemL1P9dvxr7bFKskRZbB#3d6c30db-642c)**.
+my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`) over RESP2. The full comparison with Redis (cluster mode excluded) and the roadmap are in the **[gap analysis](https://claude.ai/artifact/NhemL1P9dvxr7bFKskRZbB#3d6c30db-642c)**.
 
-### Current focus: Redis wire compatibility
+### Redis wire compatibility
 
-Several bugs stop standard clients (`redis-cli`, redis-rs, Jedis) from working correctly. Examples:
+[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 33 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining, slow subscribers and running out of file descriptors. 3 more tests in `src/server.rs` cover pub/sub channel cleanup. All of them pass.
 
-- Unknown or malformed commands get no reply, so the client hangs
-- `PUBLISH` replies with an array instead of an integer
-- `SUBSCRIBE a b c` only subscribes to the first channel
-- Non-UTF-8 keys or unexpected protocol bytes crash the connection
-
-[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down the expected Redis behavior for each of these bugs with 30 raw-RESP tests; 3 more tests in `src/server.rs` cover pub/sub channel cleanup. **Most of these tests fail on purpose until the fixes land**, so `cargo test` currently reports failures.
-
-The test expectations are themselves checked against a real Redis. All 30 pass against Redis 7.2.5:
+The test expectations are themselves checked against a real Redis. The first 30 pass against Redis 7.2.5; the three newest (cross-channel message order, lagging subscribers, and the output buffer limit) haven't been checked yet:
 
 ```bash
 redis-server --port 47392 --save "" --appendonly no --daemonize yes
@@ -306,8 +181,8 @@ redis-cli -p 47392 shutdown nosave
 
 ### Roadmap
 
-1. **Wire compatibility fixes** — make `tests/redis_compat.rs` pass *(in progress)*
-2. **Basic commands** — `PING`, `ECHO`, `DEL`, `EXISTS`, key expiration and `SET` options
+1. **Wire compatibility fixes** — make `tests/redis_compat.rs` pass *(done)*
+2. **Basic commands** — `ECHO`, `DEL`, `EXISTS`, key expiration and `SET` options
 3. **Typed values** — lists, hashes, sets, sorted sets
 4. **Transactions and persistence** — `MULTI`/`EXEC`, RDB/AOF
 5. **Protocol and security** — RESP3, `AUTH`/ACL, `INFO`, `CONFIG`
@@ -331,22 +206,22 @@ cargo test -- --nocapture
 # Run specific test suite
 cargo test --test cli_integration
 
-# Run only the Redis compatibility tests (most fail until the fixes land)
+# Run only the Redis compatibility tests
 cargo test --test redis_compat
 ```
 
 ### Test Coverage
 
-- **11 Unit Tests**: RESP frame encoding/decoding, connection state machines, and 3 pub/sub channel-cleanup tests *(cleanup tests currently fail)*
-- **7 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics
-- **30 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, verified against Redis 7.2.5 *(24 currently fail; see [Work in Progress](#-work-in-progress))*
+- **20 Unit Tests**: RESP frame encoding/decoding, request parsing (RESP and inline), and 3 pub/sub channel-cleanup tests
+- **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
+- **33 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, 30 of them verified against Redis 7.2.5
 - **3 CLI Parsing Tests**: Clap argument validation
 
 
 ### Memory Safety Guarantees
 
 - **No `unsafe` blocks**: 100% safe Rust (verified with `rg "unsafe"`)
-- **No data races**: All shared state guarded by `Arc<Mutex<T>>` or Tokio sync primitives
+- **No data races**: All shared state guarded by `Arc<Mutex<T>>`, atomics or Tokio sync primitives
 - **No use-after-free**: Ownership system enforces lifetime validity at compile time
 - **No memory leaks**: RAII ensures automatic cleanup on task panic (Tokio's `JoinHandle` drops clean up resources)
 
@@ -370,9 +245,9 @@ my-mini-redis/
 │   ├── client.rs              # Client library API
 │   ├── server.rs              # Server connection handler
 │   ├── connection.rs          # TCP stream wrapper (RESP framing)
-│   ├── frame.rs               # RESP protocol frame types
-│   ├── parse.rs               # Frame parsing utilities
-│   ├── subscription.rs        # Multi-channel subscription state
+│   ├── frame.rs               # RESP frames (replies, parsed by the client)
+│   ├── request.rs             # Request parsing (RESP arrays and inline commands)
+│   ├── subscription.rs        # Per-connection message queues and channel registry
 │   └── lib.rs                 # Public library interface
 ├── tests/
 │   ├── cli_integration.rs     # End-to-end integration tests

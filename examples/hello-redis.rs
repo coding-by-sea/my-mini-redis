@@ -1,8 +1,10 @@
-use mini_redis::{client};
+use my_redis::client::Client;
+
 #[tokio::main]
-async fn main() {
-    let mut client = client::connect("127.0.0.1:6379").await.unwrap();
-    client.set("hello", "world".into()).await.unwrap();
-    let result = client.get("hello").await.unwrap();
-    println!("hello {:?}", result.unwrap());
+async fn main() -> anyhow::Result<()> {
+    let mut client = Client::new().await?;
+    client.set("hello", "world".into()).await?;
+    let result = client.get("hello").await?;
+    println!("hello {:?}", result);
+    Ok(())
 }

@@ -1,5 +1,4 @@
 use bytes::{Buf, Bytes};
-use std::assert_matches;
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::Cursor;
@@ -30,21 +29,6 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Frame {
-    /// Returns an empty array
-    pub(crate) fn array() -> Frame {
-        Frame::Array(vec![])
-    }
-
-    // this only applies to Frame::Array
-    pub(crate) fn add_to_array(&mut self, frame: Frame) {
-        assert_matches!(self, Frame::Array(_));
-        match self {
-            Frame::Array(vec) => {
-                vec.push(frame);
-            }
-            _ => unreachable!(),
-        }
-    }
     // return whether there is at least a complete frame in bytes
     pub(crate) fn check(bytes: &mut Cursor<&[u8]>) -> Result<(), Error> {
         match Self::get_u8(bytes)? {
@@ -84,10 +68,7 @@ impl Frame {
                 }
                 Ok(())
             }
-            actual => unimplemented!(
-                "the protocol is not implemented for first byte {:?}",
-                actual
-            ),
+            _ => Err(Error::InvalidEncoding),
         }
     }
 
@@ -97,12 +78,16 @@ impl Frame {
             // simple string
             b'+' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Simple(String::from_utf8(result).unwrap()))
+                Ok(Frame::Simple(
+                    String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?,
+                ))
             }
             // simple error
             b'-' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Error(String::from_utf8(result).unwrap()))
+                Ok(Frame::Error(
+                    String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?,
+                ))
             }
             // integer
             b':' => Ok(Frame::Integer(Self::get_decimal(bytes)?)),
@@ -137,10 +122,7 @@ impl Frame {
                     Ok(Frame::Array(result))
                 }
             }
-            actual => unimplemented!(
-                "the protocol is not implemented for first byte {:?}",
-                actual
-            ),
+            _ => Err(Error::InvalidEncoding),
         }
     }
 
@@ -280,8 +262,8 @@ mod tests {
             (Frame::Null, Frame::Null) => {}
             (Frame::Array(actual), Frame::Array(expected)) => {
                 assert_eq!(actual.len(), expected.len());
-                for (actual, expected) in actual.into_iter().zip(expected) {
-                    assert_frame_eq(&actual, &expected);
+                for (actual, expected) in actual.iter().zip(expected) {
+                    assert_frame_eq(actual, expected);
                 }
             }
             _ => panic!("frame variants differ"),

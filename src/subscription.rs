@@ -1,87 +1,179 @@
-use bytes::Bytes;
-use tokio::sync::broadcast::Receiver;
-use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::{StreamExt, StreamMap};
+//! Pub/sub delivery. Each connection has one queue that PUBLISH appends to while
+//! holding the db lock, so messages from every channel reach a subscriber in the
+//! order they were published, and a slow subscriber never blocks a publisher.
 
-pub struct SubscriptionState {
-    streams: StreamMap<String, BroadcastStream<Bytes>>,
-    subscription_count: usize,
+use crate::State;
+use bytes::Bytes;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use tokio::sync::{Notify, mpsc};
+
+/// Redis's default `client-output-buffer-limit pubsub` hard limit. A subscriber with
+/// more than this queued is disconnected rather than buffered without bound.
+pub(crate) const QUEUE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+
+/// A published message: `(channel, payload)`.
+pub(crate) type Message = (Bytes, Bytes);
+
+/// The sending side of a connection's message queue, stored in the channel registry.
+#[derive(Clone)]
+pub(crate) struct Mailbox {
+    sender: mpsc::UnboundedSender<Message>,
+    shared: Arc<Shared>,
 }
 
-impl SubscriptionState {
-    pub fn new() -> Self {
+struct Shared {
+    queued_bytes: AtomicUsize,
+    overflowed: AtomicBool,
+    overflow: Notify,
+}
+
+impl Mailbox {
+    /// Queues a message. Over the limit, the message is dropped and the connection is
+    /// told to close instead.
+    fn deliver(&self, channel: &Bytes, payload: &Bytes) {
+        if self.shared.overflowed.load(Ordering::Relaxed) {
+            return;
+        }
+        let size = channel.len() + payload.len();
+        if self.shared.queued_bytes.fetch_add(size, Ordering::Relaxed) + size > QUEUE_LIMIT_BYTES {
+            self.shared.overflowed.store(true, Ordering::Relaxed);
+            self.shared.overflow.notify_one();
+            return;
+        }
+        // Fails only once the connection is gone; its cleanup removes this mailbox.
+        let _ = self.sender.send((channel.clone(), payload.clone()));
+    }
+}
+
+/// Sends `payload` to every subscriber of `channel` and returns how many there were.
+/// Never creates a registry entry for a channel without subscribers.
+pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes) -> usize {
+    let Some(subscribers) = state.subscribers.get(channel) else {
+        return 0;
+    };
+    for mailbox in subscribers.values() {
+        mailbox.deliver(channel, payload);
+    }
+    subscribers.len()
+}
+
+/// One connection's subscriptions and the receiving side of its message queue.
+pub(crate) struct Subscriptions {
+    id: u64,
+    channels: HashSet<Bytes>,
+    mailbox: Mailbox,
+    receiver: mpsc::UnboundedReceiver<Message>,
+}
+
+impl Subscriptions {
+    pub(crate) fn new() -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let (sender, receiver) = mpsc::unbounded_channel();
         Self {
-            streams: StreamMap::new(),
-            subscription_count: 0,
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            channels: HashSet::new(),
+            mailbox: Mailbox {
+                sender,
+                shared: Arc::new(Shared {
+                    queued_bytes: AtomicUsize::new(0),
+                    overflowed: AtomicBool::new(false),
+                    overflow: Notify::new(),
+                }),
+            },
+            receiver,
         }
     }
 
-    /// Subscribe to a channel. Returns true if newly subscribed, false if already subscribed.
-    pub fn subscribe(&mut self, channel: String, receiver: Receiver<Bytes>) -> bool {
-        if self.streams.contains_key(&channel) {
-            false // Already subscribed
-        } else {
-            let stream = BroadcastStream::new(receiver);
-            self.streams.insert(channel, stream);
-            self.subscription_count += 1;
-            true
+    pub(crate) fn count(&self) -> usize {
+        self.channels.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.channels.is_empty()
+    }
+
+    /// The subscribed channels, in no particular order.
+    pub(crate) fn channels(&self) -> Vec<Bytes> {
+        self.channels.iter().cloned().collect()
+    }
+
+    /// Subscribes to `channel`; subscribing twice has no extra effect.
+    pub(crate) fn subscribe(&mut self, state: &mut State, channel: Bytes) {
+        if self.channels.insert(channel.clone()) {
+            state
+                .subscribers
+                .entry(channel)
+                .or_default()
+                .insert(self.id, self.mailbox.clone());
         }
     }
 
-    /// Unsubscribe from a specific channel. Returns true if was subscribed, false otherwise.
-    pub fn unsubscribe(&mut self, channel: &str) -> bool {
-        if self.streams.remove(channel).is_some() {
-            self.subscription_count -= 1;
-            true
-        } else {
-            false
+    /// Unsubscribes from `channel`, removing the registry entry once it has no
+    /// subscribers left. Unsubscribing from a channel never joined is a no-op.
+    pub(crate) fn unsubscribe(&mut self, state: &mut State, channel: &Bytes) {
+        if self.channels.remove(channel) {
+            remove_from_registry(state, self.id, channel);
         }
     }
 
-    /// Unsubscribe from all channels. Returns the list of channels that were unsubscribed.
-    pub fn unsubscribe_all(&mut self) -> Vec<String> {
-        let channels: Vec<String> = self.streams.keys().cloned().collect();
-        self.streams.clear();
-        self.subscription_count = 0;
+    /// Unsubscribes from every channel and returns them, in no particular order.
+    pub(crate) fn unsubscribe_all(&mut self, state: &mut State) -> Vec<Bytes> {
+        let channels: Vec<Bytes> = self.channels.drain().collect();
+        for channel in &channels {
+            remove_from_registry(state, self.id, channel);
+        }
         channels
     }
 
-    /// Get the current subscription count.
-    pub fn count(&self) -> usize {
-        self.subscription_count
+    /// Takes the messages already queued, without waiting. Call it while holding the
+    /// db lock to get exactly the messages published before this point.
+    pub(crate) fn take_queued(&mut self) -> Vec<Message> {
+        let mut messages = Vec::new();
+        while let Ok(message) = self.receiver.try_recv() {
+            self.dequeued(&message);
+            messages.push(message);
+        }
+        messages
     }
 
-    /// Check if there are no active subscriptions.
-    pub fn is_empty(&self) -> bool {
-        self.subscription_count == 0
+    /// Waits for the next queued message. Cancel safe.
+    pub(crate) async fn next_message(&mut self) -> Message {
+        // The queue can't close: `self.mailbox` holds a sender for as long as `self` lives.
+        let message = self.receiver.recv().await.expect("own sender is alive");
+        self.dequeued(&message);
+        message
     }
 
-    /// Receive the next message from any subscribed channel.
-    /// Returns None if all channels are closed or there are no subscriptions.
-    pub async fn next_message(&mut self) -> Option<(String, Bytes)> {
-        loop {
-            match self.streams.next().await {
-                Some((channel, Ok(msg))) => {
-                    return Some((channel, msg));
-                }
-                Some((channel, Err(e))) => {
-                    // BroadcastStreamRecvError can be Lagged or Closed
-                    eprintln!(
-                        "Subscriber error on channel '{}': {:?}",
-                        channel, e
-                    );
-                    // Remove the channel and continue
-                    self.streams.remove(&channel);
-                    if self.subscription_count > 0 {
-                        self.subscription_count -= 1;
-                    }
-                    continue;
-                }
-                None => {
-                    // All streams exhausted
-                    return None;
-                }
-            }
+    /// A handle that completes once this connection's queue goes over its limit. It is
+    /// separate so it can be awaited alongside `next_message`.
+    pub(crate) fn overflow_signal(&self) -> OverflowSignal {
+        OverflowSignal(self.mailbox.shared.clone())
+    }
+
+    fn dequeued(&self, (channel, payload): &Message) {
+        self.mailbox
+            .shared
+            .queued_bytes
+            .fetch_sub(channel.len() + payload.len(), Ordering::Relaxed);
+    }
+}
+
+pub(crate) struct OverflowSignal(Arc<Shared>);
+
+impl OverflowSignal {
+    /// Cancel safe: a signal sent while nobody waits is kept for the next call.
+    pub(crate) async fn wait(&self) {
+        self.0.overflow.notified().await;
+    }
+}
+
+fn remove_from_registry(state: &mut State, id: u64, channel: &Bytes) {
+    if let Some(subscribers) = state.subscribers.get_mut(channel) {
+        subscribers.remove(&id);
+        if subscribers.is_empty() {
+            state.subscribers.remove(channel);
         }
     }
 }
