@@ -144,7 +144,13 @@ impl Session {
 
         match command {
             Command::Get(cmd) => {
-                replies.push(state.entries.get(cmd.key()).cloned().map_or(Frame::Null, Frame::Bulk));
+                replies.push(
+                    state
+                        .entries
+                        .get(cmd.key())
+                        .cloned()
+                        .map_or(Frame::Null, Frame::Bulk),
+                );
             }
             Command::Set(cmd) => {
                 state.entries.insert(cmd.key().clone(), cmd.value());
@@ -157,7 +163,11 @@ impl Session {
             Command::Subscribe(cmd) => {
                 for channel in cmd.channels() {
                     self.subscriptions.subscribe(&mut state, channel.clone());
-                    replies.push(push_frame("subscribe", Frame::Bulk(channel.clone()), self.subscriptions.count()));
+                    replies.push(push_frame(
+                        "subscribe",
+                        Frame::Bulk(channel.clone()),
+                        self.subscriptions.count(),
+                    ));
                 }
             }
             Command::Unsubscribe(cmd) => {
@@ -171,7 +181,11 @@ impl Session {
                 }
                 for channel in channels {
                     self.subscriptions.unsubscribe(&mut state, &channel);
-                    replies.push(push_frame("unsubscribe", Frame::Bulk(channel), self.subscriptions.count()));
+                    replies.push(push_frame(
+                        "unsubscribe",
+                        Frame::Bulk(channel),
+                        self.subscriptions.count(),
+                    ));
                 }
             }
             Command::Ping(message) => replies.push(if self.subscriptions.is_empty() {
@@ -297,11 +311,19 @@ mod tests {
         assert_eq!(channel_count(&db), 1);
 
         // One subscriber left: the channel stays.
-        request(&mut first, Unsubscribe::new(vec!["news".into()]).into_frame()).await;
+        request(
+            &mut first,
+            Unsubscribe::new(vec!["news".into()]).into_frame(),
+        )
+        .await;
         assert_eq!(channel_count(&db), 1);
 
         // Last subscriber left: the channel is removed (cleanup may finish just after the reply).
-        request(&mut second, Unsubscribe::new(vec!["news".into()]).into_frame()).await;
+        request(
+            &mut second,
+            Unsubscribe::new(vec!["news".into()]).into_frame(),
+        )
+        .await;
         wait_for_channel_count(&db, 0).await;
     }
 

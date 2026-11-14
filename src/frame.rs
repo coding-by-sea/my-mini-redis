@@ -78,12 +78,16 @@ impl Frame {
             // simple string
             b'+' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Simple(String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?))
+                Ok(Frame::Simple(
+                    String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?,
+                ))
             }
             // simple error
             b'-' => {
                 let result = Self::get_line(bytes)?.to_vec();
-                Ok(Frame::Error(String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?))
+                Ok(Frame::Error(
+                    String::from_utf8(result).map_err(|_| Error::InvalidEncoding)?,
+                ))
             }
             // integer
             b':' => Ok(Frame::Integer(Self::get_decimal(bytes)?)),

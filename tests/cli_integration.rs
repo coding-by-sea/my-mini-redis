@@ -41,7 +41,13 @@ async fn multi_channel_subscription() {
     let mut publisher = Client::new_with_address(&address).await.unwrap();
 
     // Publish to events
-    assert_eq!(publisher.publish("events", Bytes::from("event1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event1"))
+            .await
+            .unwrap(),
+        1
+    );
     let msg = timeout(Duration::from_secs(1), subscriber.next_message())
         .await
         .expect("should receive event")
@@ -51,7 +57,13 @@ async fn multi_channel_subscription() {
     assert_eq!(msg.payload, Bytes::from("event1"));
 
     // Publish to logs
-    assert_eq!(publisher.publish("logs", Bytes::from("log1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("logs", Bytes::from("log1"))
+            .await
+            .unwrap(),
+        1
+    );
     let msg = timeout(Duration::from_secs(1), subscriber.next_message())
         .await
         .expect("should receive log")
@@ -61,7 +73,13 @@ async fn multi_channel_subscription() {
     assert_eq!(msg.payload, Bytes::from("log1"));
 
     // Publish to alerts
-    assert_eq!(publisher.publish("alerts", Bytes::from("alert1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("alerts", Bytes::from("alert1"))
+            .await
+            .unwrap(),
+        1
+    );
     let msg = timeout(Duration::from_secs(1), subscriber.next_message())
         .await
         .expect("should receive alert")
@@ -83,12 +101,27 @@ async fn subscribe_multiple_channels_at_once() {
     });
 
     let mut subscriber = Client::new_with_address(&address).await.unwrap();
-    subscriber.subscribe_multiple(&["events", "logs"]).await.unwrap();
+    subscriber
+        .subscribe_multiple(&["events", "logs"])
+        .await
+        .unwrap();
 
     let mut publisher = Client::new_with_address(&address).await.unwrap();
 
-    assert_eq!(publisher.publish("events", Bytes::from("event1")).await.unwrap(), 1);
-    assert_eq!(publisher.publish("logs", Bytes::from("log1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event1"))
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        publisher
+            .publish("logs", Bytes::from("log1"))
+            .await
+            .unwrap(),
+        1
+    );
 
     // Should receive both messages
     let msg1 = timeout(Duration::from_secs(1), subscriber.next_message())
@@ -129,8 +162,14 @@ async fn unsubscribe_from_specific_channel() {
     let mut publisher = Client::new_with_address(&address).await.unwrap();
 
     // Publish to both channels
-    publisher.publish("events", Bytes::from("event1")).await.unwrap();
-    publisher.publish("logs", Bytes::from("log1")).await.unwrap();
+    publisher
+        .publish("events", Bytes::from("event1"))
+        .await
+        .unwrap();
+    publisher
+        .publish("logs", Bytes::from("log1"))
+        .await
+        .unwrap();
 
     // Should only receive logs message
     let msg = timeout(Duration::from_secs(1), subscriber.next_message())
@@ -168,13 +207,25 @@ async fn unsubscribe_from_all_channels() {
     let mut publisher = Client::new_with_address(&address).await.unwrap();
 
     // Publish to all channels
-    publisher.publish("events", Bytes::from("event1")).await.unwrap();
-    publisher.publish("logs", Bytes::from("log1")).await.unwrap();
-    publisher.publish("alerts", Bytes::from("alert1")).await.unwrap();
+    publisher
+        .publish("events", Bytes::from("event1"))
+        .await
+        .unwrap();
+    publisher
+        .publish("logs", Bytes::from("log1"))
+        .await
+        .unwrap();
+    publisher
+        .publish("alerts", Bytes::from("alert1"))
+        .await
+        .unwrap();
 
     // Should not receive any messages (timeout expected)
     let result = timeout(Duration::from_millis(100), subscriber.next_message()).await;
-    assert!(result.is_err(), "should timeout waiting for messages after unsubscribe all");
+    assert!(
+        result.is_err(),
+        "should timeout waiting for messages after unsubscribe all"
+    );
 
     server.abort();
     let _ = server.await;
@@ -195,7 +246,13 @@ async fn multiple_subscribers_on_same_channel() {
     subscriber2.subscribe("events").await.unwrap();
 
     let mut publisher = Client::new_with_address(&address).await.unwrap();
-    assert_eq!(publisher.publish("events", Bytes::from("broadcast")).await.unwrap(), 2);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("broadcast"))
+            .await
+            .unwrap(),
+        2
+    );
 
     // Both subscribers should receive the message
     let msg1 = timeout(Duration::from_secs(1), subscriber1.next_message())
@@ -231,7 +288,10 @@ async fn idempotent_subscribe() {
     subscriber.subscribe("events").await.unwrap(); // Subscribe again
 
     let mut publisher = Client::new_with_address(&address).await.unwrap();
-    publisher.publish("events", Bytes::from("test")).await.unwrap();
+    publisher
+        .publish("events", Bytes::from("test"))
+        .await
+        .unwrap();
 
     // Should receive the message only once (not duplicated)
     let msg = timeout(Duration::from_secs(1), subscriber.next_message())
@@ -289,7 +349,12 @@ async fn subscribe_mode_accepts_subscribe_and_unsubscribe_commands() {
     // Subscribing from inside subscribe mode adds the channel.
     input.write_all(b"subscribe logs\n").await.unwrap();
     timeout(Duration::from_secs(1), async {
-        while publisher.publish("logs", Bytes::from("log1")).await.unwrap() != 1 {
+        while publisher
+            .publish("logs", Bytes::from("log1"))
+            .await
+            .unwrap()
+            != 1
+        {
             tokio::task::yield_now().await;
         }
     })
@@ -303,7 +368,13 @@ async fn subscribe_mode_accepts_subscribe_and_unsubscribe_commands() {
         .expect("subscribe mode should exit once no channels remain")
         .unwrap()
         .unwrap();
-    assert_eq!(publisher.publish("events", Bytes::from("event1")).await.unwrap(), 0);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event1"))
+            .await
+            .unwrap(),
+        0
+    );
 
     server.abort();
     let _ = server.await;
@@ -345,7 +416,10 @@ impl CliSubscriber {
         use tokio::io::AsyncWriteExt;
 
         let stdin = self.stdin.as_mut().expect("stdin already closed");
-        stdin.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .unwrap();
         stdin.flush().await.unwrap();
     }
 
@@ -392,7 +466,12 @@ async fn start_server() -> (String, tokio::task::JoinHandle<()>) {
 /// printing anything, so this is how a test knows its initial subscriptions are live.
 async fn publish_until_delivered(publisher: &mut Client, channel: &str, message: &str) {
     timeout(Duration::from_secs(2), async {
-        while publisher.publish(channel, Bytes::from(message.to_owned())).await.unwrap() == 0 {
+        while publisher
+            .publish(channel, Bytes::from(message.to_owned()))
+            .await
+            .unwrap()
+            == 0
+        {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -413,9 +492,21 @@ async fn cli_subscribe_mode_subscribes_to_more_channels() {
     cli.expect_stdout("subscribed to logs").await;
     cli.expect_stdout("subscribed to alerts").await;
 
-    assert_eq!(publisher.publish("logs", Bytes::from("log1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("logs", Bytes::from("log1"))
+            .await
+            .unwrap(),
+        1
+    );
     cli.expect_stdout("logs: log1").await;
-    assert_eq!(publisher.publish("alerts", Bytes::from("alert1")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("alerts", Bytes::from("alert1"))
+            .await
+            .unwrap(),
+        1
+    );
     cli.expect_stdout("alerts: alert1").await;
 
     server.abort();
@@ -435,8 +526,20 @@ async fn cli_subscribe_mode_unsubscribes_from_named_channels() {
     cli.expect_stdout("unsubscribed from events").await;
 
     // Still subscribed to logs, so the client keeps running.
-    assert_eq!(publisher.publish("events", Bytes::from("event1")).await.unwrap(), 0);
-    assert_eq!(publisher.publish("logs", Bytes::from("log2")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event1"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        publisher
+            .publish("logs", Bytes::from("log2"))
+            .await
+            .unwrap(),
+        1
+    );
     cli.expect_stdout("logs: log2").await;
 
     cli.send("unsubscribe logs").await;
@@ -473,8 +576,20 @@ async fn cli_subscribe_mode_bare_unsubscribe_leaves_every_channel_and_exits() {
     assert_eq!(left, ["unsubscribed from events", "unsubscribed from logs"]);
     cli.expect_exit_success().await;
 
-    assert_eq!(publisher.publish("events", Bytes::from("event2")).await.unwrap(), 0);
-    assert_eq!(publisher.publish("logs", Bytes::from("log1")).await.unwrap(), 0);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event2"))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        publisher
+            .publish("logs", Bytes::from("log1"))
+            .await
+            .unwrap(),
+        0
+    );
 
     server.abort();
     let _ = server.await;
@@ -490,13 +605,20 @@ async fn cli_subscribe_mode_rejects_other_commands_and_keeps_listening() {
     cli.expect_stdout("events: event1").await;
 
     cli.send("get greeting").await;
-    cli.expect_stderr_containing("only subscribe and unsubscribe are allowed").await;
+    cli.expect_stderr_containing("only subscribe and unsubscribe are allowed")
+        .await;
     cli.send("subscribe").await;
     cli.expect_stderr_containing("usage: subscribe").await;
     // Blank lines are ignored.
     cli.send("").await;
 
-    assert_eq!(publisher.publish("events", Bytes::from("event2")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event2"))
+            .await
+            .unwrap(),
+        1
+    );
     cli.expect_stdout("events: event2").await;
 
     server.abort();
@@ -536,7 +658,13 @@ async fn cli_subscribe_mode_keeps_receiving_after_stdin_closes() {
     // Give the client a moment to see EOF before publishing again.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    assert_eq!(publisher.publish("events", Bytes::from("event2")).await.unwrap(), 1);
+    assert_eq!(
+        publisher
+            .publish("events", Bytes::from("event2"))
+            .await
+            .unwrap(),
+        1
+    );
     cli.expect_stdout("events: event2").await;
 
     server.abort();
@@ -556,12 +684,20 @@ async fn cli_subscribe_mode_handles_commands_while_a_channel_is_busy() {
     // Keep the subscriber's connection saturated with messages.
     let flood = tokio::spawn(async move {
         loop {
-            publisher.publish("events", Bytes::from("noise")).await.unwrap();
+            publisher
+                .publish("events", Bytes::from("noise"))
+                .await
+                .unwrap();
         }
     });
 
     // Drain stdout so the client never blocks on a full pipe, and report the unsubscribe ack.
-    let CliSubscriber { mut child, stdin, mut stdout, .. } = cli;
+    let CliSubscriber {
+        mut child,
+        stdin,
+        mut stdout,
+        ..
+    } = cli;
     let saw_unsubscribe = tokio::spawn(async move {
         while let Some(line) = stdout.next_line().await.unwrap() {
             if line == "unsubscribed from events" {
@@ -580,7 +716,10 @@ async fn cli_subscribe_mode_handles_commands_while_a_channel_is_busy() {
         .await
         .expect("unsubscribe should be handled while the channel is busy")
         .unwrap();
-    assert!(acknowledged, "stdout closed before the unsubscribe was acknowledged");
+    assert!(
+        acknowledged,
+        "stdout closed before the unsubscribe was acknowledged"
+    );
     let status = timeout(Duration::from_secs(2), child.wait())
         .await
         .expect("client should exit")

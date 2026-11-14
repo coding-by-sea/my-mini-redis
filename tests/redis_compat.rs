@@ -85,7 +85,9 @@ fn push(kind: &str, channel: impl AsRef<[u8]>, last: Reply) -> Reply {
 const TARGET_ENV: &str = "REDIS_COMPAT_TARGET";
 
 fn external_target() -> Option<String> {
-    std::env::var(TARGET_ENV).ok().filter(|address| !address.is_empty())
+    std::env::var(TARGET_ENV)
+        .ok()
+        .filter(|address| !address.is_empty())
 }
 
 /// The server a test talks to. Dropping it (or calling `abort`) stops our own server.
@@ -114,7 +116,9 @@ impl Drop for TestServer {
 async fn start_server() -> (String, TestServer) {
     if let Some(address) = external_target() {
         static SERIAL: Mutex<()> = Mutex::new(());
-        let guard = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let guard = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut client = RawClient::connect(&address).await;
         assert_eq!(client.cmd(&[b"FLUSHALL"]).await, ok());
         let server = TestServer {
@@ -244,7 +248,10 @@ fn read_reply<'a>(
     Box::pin(async move {
         let mut line = Vec::new();
         if reader.read_until(b'\n', &mut line).await? == 0 {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed"));
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "connection closed",
+            ));
         }
         if line.len() < 3 || !line.ends_with(b"\r\n") {
             return Err(invalid(format!(
@@ -330,7 +337,9 @@ async fn errors_inside_a_pipeline_do_not_shift_later_replies() {
     client.send_raw(&batch).await;
 
     assert_eq!(client.read().await, ok());
-    client.assert_error_starting_with("ERR unknown command 'FOOBAR'").await;
+    client
+        .assert_error_starting_with("ERR unknown command 'FOOBAR'")
+        .await;
     assert_eq!(
         client.read().await,
         Reply::Error("ERR wrong number of arguments for 'get' command".into())
@@ -373,10 +382,7 @@ async fn publish_replies_with_integer_receiver_count() {
         publisher.cmd(&[b"PUBLISH", b"news", b"hi"]).await,
         Reply::Integer(1)
     );
-    assert_eq!(
-        subscriber.read().await,
-        push("message", "news", bulk("hi"))
-    );
+    assert_eq!(subscriber.read().await, push("message", "news", bulk("hi")));
 
     let mut second = RawClient::connect(&address).await;
     assert_eq!(
@@ -387,7 +393,10 @@ async fn publish_replies_with_integer_receiver_count() {
         publisher.cmd(&[b"PUBLISH", b"news", b"both"]).await,
         Reply::Integer(2)
     );
-    assert_eq!(subscriber.read().await, push("message", "news", bulk("both")));
+    assert_eq!(
+        subscriber.read().await,
+        push("message", "news", bulk("both"))
+    );
     assert_eq!(second.read().await, push("message", "news", bulk("both")));
     server.abort();
 }
@@ -402,9 +411,18 @@ async fn subscribe_to_several_channels_in_one_command() {
     let mut subscriber = RawClient::connect(&address).await;
 
     subscriber.send(&[b"SUBSCRIBE", b"a", b"b", b"c"]).await;
-    assert_eq!(subscriber.read().await, push("subscribe", "a", Reply::Integer(1)));
-    assert_eq!(subscriber.read().await, push("subscribe", "b", Reply::Integer(2)));
-    assert_eq!(subscriber.read().await, push("subscribe", "c", Reply::Integer(3)));
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "a", Reply::Integer(1))
+    );
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "b", Reply::Integer(2))
+    );
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "c", Reply::Integer(3))
+    );
 
     let mut publisher = RawClient::connect(&address).await;
     for channel in ["a", "b", "c"] {
@@ -423,8 +441,14 @@ async fn subscribe_to_the_same_channel_twice_in_one_command_counts_once() {
     let mut subscriber = RawClient::connect(&address).await;
 
     subscriber.send(&[b"SUBSCRIBE", b"a", b"a"]).await;
-    assert_eq!(subscriber.read().await, push("subscribe", "a", Reply::Integer(1)));
-    assert_eq!(subscriber.read().await, push("subscribe", "a", Reply::Integer(1)));
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "a", Reply::Integer(1))
+    );
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "a", Reply::Integer(1))
+    );
     server.abort();
 }
 
@@ -472,18 +496,32 @@ async fn unsubscribe_from_named_channels_reports_current_count() {
 
     client.send(&[b"SUBSCRIBE", b"a", b"b", b"c"]).await;
     for count in 1..=3 {
-        assert!(matches!(client.read().await, Reply::Array(_)), "ack {count}");
+        assert!(
+            matches!(client.read().await, Reply::Array(_)),
+            "ack {count}"
+        );
     }
 
     // Named channels are answered in request order; one we never joined still gets a reply.
     client.send(&[b"UNSUBSCRIBE", b"a", b"never", b"b"]).await;
-    assert_eq!(client.read().await, push("unsubscribe", "a", Reply::Integer(2)));
-    assert_eq!(client.read().await, push("unsubscribe", "never", Reply::Integer(2)));
-    assert_eq!(client.read().await, push("unsubscribe", "b", Reply::Integer(1)));
+    assert_eq!(
+        client.read().await,
+        push("unsubscribe", "a", Reply::Integer(2))
+    );
+    assert_eq!(
+        client.read().await,
+        push("unsubscribe", "never", Reply::Integer(2))
+    );
+    assert_eq!(
+        client.read().await,
+        push("unsubscribe", "b", Reply::Integer(1))
+    );
 
     // Still subscribed to c, so regular commands are still blocked.
     client.send(&[b"GET", b"k"]).await;
-    client.assert_error_starting_with("ERR Can't execute 'get'").await;
+    client
+        .assert_error_starting_with("ERR Can't execute 'get'")
+        .await;
     server.abort();
 }
 
@@ -502,9 +540,13 @@ async fn regular_commands_are_rejected_while_subscribed() {
     );
 
     client.send(&[b"GET", b"k"]).await;
-    client.assert_error_starting_with("ERR Can't execute 'get'").await;
+    client
+        .assert_error_starting_with("ERR Can't execute 'get'")
+        .await;
     client.send(&[b"SET", b"k", b"v"]).await;
-    client.assert_error_starting_with("ERR Can't execute 'set'").await;
+    client
+        .assert_error_starting_with("ERR Can't execute 'set'")
+        .await;
     client.send(&[b"PUBLISH", b"a", b"m"]).await;
     client
         .assert_error_starting_with("ERR Can't execute 'publish'")
@@ -521,9 +563,11 @@ async fn regular_commands_are_rejected_while_subscribed() {
     for expected_count in [1, 0] {
         match client.read().await {
             Reply::Array(parts) => match parts.as_slice() {
-                [Reply::Bulk(kind), Reply::Bulk(channel), Reply::Integer(count)]
-                    if kind.as_slice() == b"unsubscribe" =>
-                {
+                [
+                    Reply::Bulk(kind),
+                    Reply::Bulk(channel),
+                    Reply::Integer(count),
+                ] if kind.as_slice() == b"unsubscribe" => {
                     assert_eq!(*count, expected_count);
                     channels.push(channel.clone());
                 }
@@ -551,7 +595,9 @@ async fn unknown_command_and_arity_errors_take_priority_while_subscribed() {
         push("subscribe", "a", Reply::Integer(1))
     );
     client.send(&[b"FOOBAR"]).await;
-    client.assert_error_starting_with("ERR unknown command 'FOOBAR'").await;
+    client
+        .assert_error_starting_with("ERR unknown command 'FOOBAR'")
+        .await;
     assert_eq!(
         client.cmd(&[b"GET"]).await,
         Reply::Error("ERR wrong number of arguments for 'get' command".into())
@@ -665,7 +711,10 @@ async fn non_utf8_channel_names_work_for_pubsub() {
         push("subscribe", channel, Reply::Integer(1))
     );
     publisher.publish(channel, b"\xff").await;
-    assert_eq!(subscriber.read().await, push("message", channel, bulk(b"\xff")));
+    assert_eq!(
+        subscriber.read().await,
+        push("message", channel, bulk(b"\xff"))
+    );
     server.abort();
 }
 
@@ -675,7 +724,9 @@ async fn non_utf8_command_name_is_an_unknown_command_not_a_crash() {
     let mut client = RawClient::connect(&address).await;
 
     client.send(&[b"\xff\xfe", b"x"]).await;
-    client.assert_error_starting_with("ERR unknown command").await;
+    client
+        .assert_error_starting_with("ERR unknown command")
+        .await;
     client.assert_usable().await;
     server.abort();
 }
@@ -689,11 +740,11 @@ async fn malformed_resp_gets_protocol_error_and_closes_only_that_connection() {
     let (address, server) = start_server().await;
 
     let cases: [&[u8]; 5] = [
-        b"*1\r\n!3\r\nfoo\r\n",        // unknown type byte inside an array
-        b"*2\r\n$3\r\nGET\r\n:1\r\n",  // non-bulk argument
-        b"*1\r\n$abc\r\n",              // invalid bulk length
-        b"*abc\r\n",                    // invalid array length
-        b"*1\r\n$-5\r\n",               // negative bulk length in a request
+        b"*1\r\n!3\r\nfoo\r\n",       // unknown type byte inside an array
+        b"*2\r\n$3\r\nGET\r\n:1\r\n", // non-bulk argument
+        b"*1\r\n$abc\r\n",            // invalid bulk length
+        b"*abc\r\n",                  // invalid array length
+        b"*1\r\n$-5\r\n",             // negative bulk length in a request
     ];
 
     for input in cases {
@@ -723,7 +774,9 @@ async fn protocol_error_after_valid_commands_answers_them_first() {
 
     assert_eq!(client.read().await, ok());
     assert_eq!(client.read().await, bulk("1"));
-    client.assert_error_starting_with("ERR Protocol error").await;
+    client
+        .assert_error_starting_with("ERR Protocol error")
+        .await;
     client.assert_closed().await;
     server.abort();
 }
@@ -810,7 +863,11 @@ async fn start_fd_limited_server() -> (String, ChildGuard) {
 async fn try_round_trip(address: &str) -> bool {
     let attempt = async {
         let mut client = RawClient::from_stream(TcpStream::connect(address).await.ok()?);
-        client.writer.write_all(&encode(&[b"SET", b"health", b"check"])).await.ok()?;
+        client
+            .writer
+            .write_all(&encode(&[b"SET", b"health", b"check"]))
+            .await
+            .ok()?;
         read_reply(&mut client.reader).await.ok()
     };
     matches!(timeout(Duration::from_secs(1), attempt).await, Ok(Some(reply)) if reply == ok())
@@ -837,7 +894,8 @@ async fn server_survives_running_out_of_file_descriptors() {
     if let Ok(stream) = TcpStream::connect(&address).await {
         let mut late = RawClient::from_stream(stream);
         late.send(&[b"GET", b"k"]).await;
-        late.assert_no_reply_within(Duration::from_millis(500)).await;
+        late.assert_no_reply_within(Duration::from_millis(500))
+            .await;
     }
 
     assert!(
@@ -986,7 +1044,9 @@ async fn inline_commands_are_accepted() {
     let (address, server) = start_server().await;
     let mut client = RawClient::connect(&address).await;
 
-    client.send_raw(b"SET greeting hello\r\nGET greeting\r\n").await;
+    client
+        .send_raw(b"SET greeting hello\r\nGET greeting\r\n")
+        .await;
     assert_eq!(client.read().await, ok());
     assert_eq!(client.read().await, bulk("hello"));
 
@@ -1048,7 +1108,9 @@ async fn inline_command_with_unbalanced_quotes_is_a_protocol_error() {
     let mut client = RawClient::connect(&address).await;
 
     client.send_raw(b"SET k \"unterminated\r\n").await;
-    client.assert_error_starting_with("ERR Protocol error").await;
+    client
+        .assert_error_starting_with("ERR Protocol error")
+        .await;
     client.assert_closed().await;
 
     RawClient::connect(&address).await.assert_usable().await;
@@ -1066,9 +1128,15 @@ async fn messages_from_several_channels_arrive_in_publish_order() {
     let mut publisher = RawClient::connect(&address).await;
 
     subscriber.send(&[b"SUBSCRIBE", b"a"]).await;
-    assert_eq!(subscriber.read().await, push("subscribe", "a", Reply::Integer(1)));
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "a", Reply::Integer(1))
+    );
     subscriber.send(&[b"SUBSCRIBE", b"b"]).await;
-    assert_eq!(subscriber.read().await, push("subscribe", "b", Reply::Integer(2)));
+    assert_eq!(
+        subscriber.read().await,
+        push("subscribe", "b", Reply::Integer(2))
+    );
 
     // Pipeline the publishes in one write so several messages are pending on both
     // channels at once. Redis delivers them in the order it ran the PUBLISHes.
@@ -1180,10 +1248,15 @@ async fn subscriber_over_the_output_buffer_limit_is_disconnected() {
                 received += 1;
             }
             Ok(Err(_)) => break, // EOF or reset: disconnected
-            Err(_) => panic!("subscriber neither disconnected nor sent more after {received} messages"),
+            Err(_) => {
+                panic!("subscriber neither disconnected nor sent more after {received} messages")
+            }
         }
     }
-    assert!(received < MESSAGES, "every message arrived, so nothing was cut off");
+    assert!(
+        received < MESSAGES,
+        "every message arrived, so nothing was cut off"
+    );
 
     // The server and other clients are unaffected.
     publisher.assert_usable().await;

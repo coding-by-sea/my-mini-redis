@@ -46,7 +46,11 @@ impl Command {
             _ => return Err(unknown_command(&args)),
         };
         let argc = args.len() as i32;
-        let wrong_arity = if arity > 0 { argc != arity } else { argc < -arity };
+        let wrong_arity = if arity > 0 {
+            argc != arity
+        } else {
+            argc < -arity
+        };
         // PING takes at most one argument, which Redis checks inside the command.
         if wrong_arity || (name == b"ping" && argc > 2) {
             return Err(format!(

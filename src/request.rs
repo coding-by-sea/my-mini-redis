@@ -37,7 +37,10 @@ fn parse_multibulk(buf: &[u8]) -> Result<Parsed, ProtocolError> {
         .filter(|&count| count <= i32::MAX as i64)
         .ok_or_else(|| ProtocolError("invalid multibulk length".into()))?;
     if count <= 0 {
-        return Ok(Parsed::Request { args: Vec::new(), consumed: pos });
+        return Ok(Parsed::Request {
+            args: Vec::new(),
+            consumed: pos,
+        });
     }
 
     // Don't trust the count for preallocation: it comes from the client.
@@ -47,7 +50,10 @@ fn parse_multibulk(buf: &[u8]) -> Result<Parsed, ProtocolError> {
             None => return Ok(Parsed::Incomplete),
             Some(b'$') => {}
             Some(&other) => {
-                return Err(ProtocolError(format!("expected '$', got '{}'", other as char)));
+                return Err(ProtocolError(format!(
+                    "expected '$', got '{}'",
+                    other as char
+                )));
             }
         }
         let Some((line, start)) = header_line(buf, pos, "too big bulk count string")? else {
@@ -63,7 +69,10 @@ fn parse_multibulk(buf: &[u8]) -> Result<Parsed, ProtocolError> {
         args.push(Bytes::copy_from_slice(&buf[start..start + len]));
         pos = start + len + 2;
     }
-    Ok(Parsed::Request { args, consumed: pos })
+    Ok(Parsed::Request {
+        args,
+        consumed: pos,
+    })
 }
 
 /// Returns the text of the `*`/`$` line starting at `start` (without its type byte or
@@ -100,10 +109,15 @@ fn parse_inline(buf: &[u8]) -> Result<Parsed, ProtocolError> {
         }
         return Ok(Parsed::Incomplete);
     };
-    let line = buf[..newline].strip_suffix(b"\r").unwrap_or(&buf[..newline]);
-    let args = split_args(line)
-        .ok_or_else(|| ProtocolError("unbalanced quotes in request".into()))?;
-    Ok(Parsed::Request { args, consumed: newline + 1 })
+    let line = buf[..newline]
+        .strip_suffix(b"\r")
+        .unwrap_or(&buf[..newline]);
+    let args =
+        split_args(line).ok_or_else(|| ProtocolError("unbalanced quotes in request".into()))?;
+    Ok(Parsed::Request {
+        args,
+        consumed: newline + 1,
+    })
 }
 
 /// Splits an inline command into arguments like Redis's `sdssplitargs`: whitespace
@@ -134,10 +148,11 @@ fn split_args(line: &[u8]) -> Option<Vec<Bytes>> {
             };
             if in_double {
                 match c {
-                    b'\\' if i + 3 < line.len()
-                        && line[i + 1] == b'x'
-                        && line[i + 2].is_ascii_hexdigit()
-                        && line[i + 3].is_ascii_hexdigit() =>
+                    b'\\'
+                        if i + 3 < line.len()
+                            && line[i + 1] == b'x'
+                            && line[i + 2].is_ascii_hexdigit()
+                            && line[i + 3].is_ascii_hexdigit() =>
                     {
                         arg.push(hex_value(line[i + 2]) * 16 + hex_value(line[i + 3]));
                         i += 3;
@@ -154,7 +169,10 @@ fn split_args(line: &[u8]) -> Option<Vec<Bytes>> {
                         });
                     }
                     b'"' => {
-                        if line.get(i + 1).is_some_and(|next| !next.is_ascii_whitespace()) {
+                        if line
+                            .get(i + 1)
+                            .is_some_and(|next| !next.is_ascii_whitespace())
+                        {
                             return None;
                         }
                         i += 1;
@@ -169,7 +187,10 @@ fn split_args(line: &[u8]) -> Option<Vec<Bytes>> {
                         arg.push(b'\'');
                     }
                     b'\'' => {
-                        if line.get(i + 1).is_some_and(|next| !next.is_ascii_whitespace()) {
+                        if line
+                            .get(i + 1)
+                            .is_some_and(|next| !next.is_ascii_whitespace())
+                        {
                             return None;
                         }
                         i += 1;
@@ -205,7 +226,10 @@ mod tests {
 
     fn request(args: &[&str], consumed: usize) -> Result<Parsed, ProtocolError> {
         Ok(Parsed::Request {
-            args: args.iter().map(|arg| arg.as_bytes().to_vec().into()).collect(),
+            args: args
+                .iter()
+                .map(|arg| arg.as_bytes().to_vec().into())
+                .collect(),
             consumed,
         })
     }
@@ -224,7 +248,11 @@ mod tests {
     fn waits_for_the_rest_of_a_multibulk_request() {
         let input = b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
         for end in 0..input.len() {
-            assert_eq!(parse(&input[..end]), Ok(Parsed::Incomplete), "prefix of {end} bytes");
+            assert_eq!(
+                parse(&input[..end]),
+                Ok(Parsed::Incomplete),
+                "prefix of {end} bytes"
+            );
         }
     }
 
@@ -236,11 +264,26 @@ mod tests {
 
     #[test]
     fn rejects_malformed_multibulk_requests() {
-        assert_eq!(parse(b"*abc\r\n"), protocol_error("invalid multibulk length"));
-        assert_eq!(parse(b"*1\r\n$abc\r\n"), protocol_error("invalid bulk length"));
-        assert_eq!(parse(b"*1\r\n$-5\r\n"), protocol_error("invalid bulk length"));
-        assert_eq!(parse(b"*1\r\n!3\r\nfoo\r\n"), protocol_error("expected '$', got '!'"));
-        assert_eq!(parse(b"*1\r\n:1\r\n"), protocol_error("expected '$', got ':'"));
+        assert_eq!(
+            parse(b"*abc\r\n"),
+            protocol_error("invalid multibulk length")
+        );
+        assert_eq!(
+            parse(b"*1\r\n$abc\r\n"),
+            protocol_error("invalid bulk length")
+        );
+        assert_eq!(
+            parse(b"*1\r\n$-5\r\n"),
+            protocol_error("invalid bulk length")
+        );
+        assert_eq!(
+            parse(b"*1\r\n!3\r\nfoo\r\n"),
+            protocol_error("expected '$', got '!'")
+        );
+        assert_eq!(
+            parse(b"*1\r\n:1\r\n"),
+            protocol_error("expected '$', got ':'")
+        );
     }
 
     #[test]
@@ -264,9 +307,18 @@ mod tests {
             parse(b"SET k \"hello world\\n\"\r\n"),
             request(&["SET", "k", "hello world\n"], 23)
         );
-        assert_eq!(parse(b"SET k \"\\x41\\tB\"\n"), request(&["SET", "k", "A\tB"], 16));
-        assert_eq!(parse(b"SET k 'it\\'s'\n"), request(&["SET", "k", "it's"], 14));
-        assert_eq!(parse(b"SET k a\"b c\"\n"), request(&["SET", "k", "ab c"], 13));
+        assert_eq!(
+            parse(b"SET k \"\\x41\\tB\"\n"),
+            request(&["SET", "k", "A\tB"], 16)
+        );
+        assert_eq!(
+            parse(b"SET k 'it\\'s'\n"),
+            request(&["SET", "k", "it's"], 14)
+        );
+        assert_eq!(
+            parse(b"SET k a\"b c\"\n"),
+            request(&["SET", "k", "ab c"], 13)
+        );
     }
 
     #[test]
@@ -279,6 +331,9 @@ mod tests {
 
     #[test]
     fn rejects_an_oversized_inline_request() {
-        assert_eq!(parse(&vec![b'a'; 70 * 1024]), protocol_error("too big inline request"));
+        assert_eq!(
+            parse(&vec![b'a'; 70 * 1024]),
+            protocol_error("too big inline request")
+        );
     }
 }

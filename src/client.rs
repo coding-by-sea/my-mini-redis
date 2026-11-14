@@ -3,9 +3,9 @@ use crate::cmd::{Get, Publish, Set, Subscribe, Unsubscribe};
 use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
-use tokio::net::TcpStream;
 use std::collections::{HashSet, VecDeque};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
 
 pub struct Client {
     connection: Connection,
@@ -82,7 +82,8 @@ impl Client {
         if channels.is_empty() {
             return self.unsubscribe_all().await;
         }
-        let unsubscribe_frame = Unsubscribe::new(channels.iter().map(|s| s.to_string()).collect()).into_frame();
+        let unsubscribe_frame =
+            Unsubscribe::new(channels.iter().map(|s| s.to_string()).collect()).into_frame();
         self.connection.write_frame(unsubscribe_frame).await?;
 
         // One acknowledgment per channel, in request order.
@@ -107,9 +108,12 @@ impl Client {
     async fn read_unsubscribe_ack(&mut self) -> anyhow::Result<i64> {
         match self.read_reply().await? {
             Frame::Array(parts) => match parts.as_slice() {
-                [Frame::Bulk(kind), channel, Frame::Integer(count)] if kind.as_ref() == b"unsubscribe" => {
+                [Frame::Bulk(kind), channel, Frame::Integer(count)]
+                    if kind.as_ref() == b"unsubscribe" =>
+                {
                     if let Frame::Bulk(channel) = channel {
-                        self.subscriptions.remove(String::from_utf8_lossy(channel).as_ref());
+                        self.subscriptions
+                            .remove(String::from_utf8_lossy(channel).as_ref());
                     }
                     Ok(*count)
                 }
@@ -178,7 +182,8 @@ impl Client {
                 }
             }
         });
-        self.enter_subscribe_mode_with_input(BufReader::new(reader)).await
+        self.enter_subscribe_mode_with_input(BufReader::new(reader))
+            .await
     }
 
     /// Prints incoming messages while accepting `subscribe <channel>...` and
@@ -227,12 +232,16 @@ impl Client {
         match command.to_ascii_lowercase().as_str() {
             "subscribe" if !channels.is_empty() => {
                 for channel in channels {
-                    self.connection.write_frame(Subscribe::new(channel).into_frame()).await?;
+                    self.connection
+                        .write_frame(Subscribe::new(channel).into_frame())
+                        .await?;
                 }
             }
             "subscribe" => eprintln!("usage: subscribe <channel> [channel...]"),
             "unsubscribe" => {
-                self.connection.write_frame(Unsubscribe::new(channels).into_frame()).await?;
+                self.connection
+                    .write_frame(Unsubscribe::new(channels).into_frame())
+                    .await?;
             }
             _ => eprintln!("only subscribe and unsubscribe are allowed in subscribe mode"),
         }
@@ -248,46 +257,66 @@ impl Client {
         };
 
         match parts.as_slice() {
-            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Bulk(payload)] if kind.as_ref() == b"message" => {
+            [
+                Frame::Bulk(kind),
+                Frame::Bulk(channel),
+                Frame::Bulk(payload),
+            ] if kind.as_ref() == b"message" => {
                 print_message(&Message {
                     channel: String::from_utf8_lossy(channel).into_owned(),
                     payload: payload.clone(),
                 });
                 Ok(false)
             }
-            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(_)] if kind.as_ref() == b"subscribe" => {
+            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(_)]
+                if kind.as_ref() == b"subscribe" =>
+            {
                 let channel = String::from_utf8(channel.to_vec())?;
                 println!("subscribed to {}", channel);
                 self.subscriptions.insert(channel);
                 Ok(false)
             }
-            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(count)] if kind.as_ref() == b"unsubscribe" => {
+            [
+                Frame::Bulk(kind),
+                Frame::Bulk(channel),
+                Frame::Integer(count),
+            ] if kind.as_ref() == b"unsubscribe" => {
                 let channel = String::from_utf8_lossy(channel);
                 println!("unsubscribed from {}", channel);
                 self.subscriptions.remove(channel.as_ref());
                 Ok(*count == 0)
             }
             // A bare UNSUBSCRIBE with no subscriptions left.
-            [Frame::Bulk(kind), Frame::Null, Frame::Integer(_)] if kind.as_ref() == b"unsubscribe" => Ok(true),
+            [Frame::Bulk(kind), Frame::Null, Frame::Integer(_)]
+                if kind.as_ref() == b"unsubscribe" =>
+            {
+                Ok(true)
+            }
             _ => anyhow::bail!("invalid subscription message"),
         }
     }
 }
 
 fn print_message(message: &Message) {
-    println!("{}: {}", message.channel, String::from_utf8_lossy(&message.payload));
+    println!(
+        "{}: {}",
+        message.channel,
+        String::from_utf8_lossy(&message.payload)
+    );
 }
 
 /// Returns the message if `frame` is a published `[message, channel, payload]`.
 fn parse_message(frame: &Frame) -> Option<Message> {
     match frame {
         Frame::Array(parts) => match parts.as_slice() {
-            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Bulk(payload)] if kind.as_ref() == b"message" => {
-                Some(Message {
-                    channel: String::from_utf8_lossy(channel).into_owned(),
-                    payload: payload.clone(),
-                })
-            }
+            [
+                Frame::Bulk(kind),
+                Frame::Bulk(channel),
+                Frame::Bulk(payload),
+            ] if kind.as_ref() == b"message" => Some(Message {
+                channel: String::from_utf8_lossy(channel).into_owned(),
+                payload: payload.clone(),
+            }),
             _ => None,
         },
         _ => None,
