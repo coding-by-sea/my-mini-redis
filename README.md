@@ -173,7 +173,7 @@ my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE
 
 [`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 33 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining, slow subscribers and running out of file descriptors. 3 more tests in `src/server.rs` cover pub/sub channel cleanup. All of them pass.
 
-The test expectations are themselves checked against a real Redis. The first 30 pass against Redis 7.2.5; the three newest (cross-channel message order, lagging subscribers, and the output buffer limit) haven't been checked yet:
+The test expectations are themselves checked against a real Redis: CI's `redis-compat` job runs them against Redis 7.2.5 on every pull request, and all pass there (the file-descriptor test skips itself in that mode). To run that check locally:
 
 ```bash
 redis-server --port 47392 --save "" --appendonly no --daemonize yes
