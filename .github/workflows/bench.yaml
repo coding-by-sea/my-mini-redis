@@ -1,0 +1,41 @@
+name: bench
+
+# Runs the load benchmark against my-mini-redis and a real Redis on demand.
+# Shared CI runners are noisy, so compare ratios within one run rather than
+# absolute numbers across runs. The report is in the job summary and as an artifact.
+on:
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "Options for scripts/bench.sh, e.g. --quick or --duration 10"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    name: my-mini-redis vs Redis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install redis-server
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y redis-server
+          # The benchmark starts its own instance; the system service isn't needed.
+          sudo systemctl stop redis-server
+      # Passed through the environment, not interpolated into the script, so the input
+      # can't inject shell commands. Word splitting into options is intended.
+      - run: scripts/bench.sh $BENCH_ARGS
+        env:
+          BENCH_ARGS: ${{ inputs.args }}
+      - run: cat target/bench/latest.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: target/bench/
