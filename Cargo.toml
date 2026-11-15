@@ -2,13 +2,14 @@
 name = "my-redis"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.86"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-bytes = "1"
-anyhow = "1"
+tokio = { version = "1.12", features = ["full"] }
+bytes = "1.2.1"
+anyhow = "1.0.20"
 atoi = "3"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4.4.2", features = ["derive"] }
 
 [[bin]]
 name = "my-mini-redis-cli"
