@@ -29,7 +29,8 @@
 //! - Tests run one at a time (a shared lock in `start_server`), because they reuse key and
 //!   channel names on the same server.
 //! - `server_survives_running_out_of_file_descriptors` (1.8) skips itself, since it starts
-//!   this project's server binary.
+//!   this project's server binary. It is also Unix only in either mode, since it limits
+//!   file descriptors with `ulimit`.
 //! - The in-crate 1.9 tests in `src/server.rs` are not covered; they inspect this
 //!   project's internal state.
 //!
@@ -39,7 +40,6 @@
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
 use my_redis::server::Server;
@@ -50,7 +50,6 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
 const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
-const SERVER_BINARY: &str = env!("CARGO_BIN_EXE_my-mini-redis-server");
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -813,110 +812,119 @@ async fn request_split_across_many_writes_is_reassembled() {
 // 1.8 A failed accept() does not stop the server
 // ---------------------------------------------------------------------------
 
-/// Kills the server process when the test ends, even on panic.
-struct ChildGuard(Child);
+/// Limiting file descriptors relies on `sh -c "ulimit -n ..."`, so this test is Unix only.
+#[cfg(unix)]
+mod accept_failure {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
 
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+    const SERVER_BINARY: &str = env!("CARGO_BIN_EXE_my-mini-redis-server");
+
+    /// Kills the server process when the test ends, even on panic.
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
-}
 
-/// Starts the server binary with at most 32 open files, so accept() fails with
-/// EMFILE once about 25 clients are connected. Retries on a new port if another
-/// process grabbed the chosen one before the server bound it.
-async fn start_fd_limited_server() -> (String, ChildGuard) {
-    for _ in 0..3 {
-        let address = {
-            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            probe.local_addr().unwrap().to_string()
+    /// Starts the server binary with at most 32 open files, so accept() fails with
+    /// EMFILE once about 25 clients are connected. Retries on a new port if another
+    /// process grabbed the chosen one before the server bound it.
+    async fn start_fd_limited_server() -> (String, ChildGuard) {
+        for _ in 0..3 {
+            let address = {
+                let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                probe.local_addr().unwrap().to_string()
+            };
+            let mut server = ChildGuard(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg("ulimit -n 32 && exec \"$0\"")
+                    .arg(SERVER_BINARY)
+                    .env("MY_MINI_REDIS_ADDRESS", &address)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .expect("failed to start server binary"),
+            );
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if server.0.try_wait().unwrap().is_some() {
+                    break; // could not bind the port: try another one
+                }
+                if TcpStream::connect(&address).await.is_ok() {
+                    return (address, server);
+                }
+                assert!(Instant::now() < deadline, "server never started listening");
+                sleep(Duration::from_millis(20)).await;
+            }
+        }
+        panic!("could not start the server on a free port");
+    }
+
+    /// One SET/GET round trip with short timeouts; false on any failure.
+    async fn try_round_trip(address: &str) -> bool {
+        let attempt = async {
+            let mut client = RawClient::from_stream(TcpStream::connect(address).await.ok()?);
+            client
+                .writer
+                .write_all(&encode(&[b"SET", b"health", b"check"]))
+                .await
+                .ok()?;
+            read_reply(&mut client.reader).await.ok()
         };
-        let mut server = ChildGuard(
-            Command::new("sh")
-                .arg("-c")
-                .arg("ulimit -n 32 && exec \"$0\"")
-                .arg(SERVER_BINARY)
-                .env("MY_MINI_REDIS_ADDRESS", &address)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .expect("failed to start server binary"),
-        );
+        matches!(timeout(Duration::from_secs(1), attempt).await, Ok(Some(reply)) if reply == ok())
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if server.0.try_wait().unwrap().is_some() {
-                break; // could not bind the port: try another one
-            }
-            if TcpStream::connect(&address).await.is_ok() {
-                return (address, server);
-            }
-            assert!(Instant::now() < deadline, "server never started listening");
-            sleep(Duration::from_millis(20)).await;
+    #[tokio::test]
+    async fn server_survives_running_out_of_file_descriptors() {
+        if external_target().is_some() {
+            eprintln!("skipped: this test starts this project's own server binary");
+            return;
         }
-    }
-    panic!("could not start the server on a free port");
-}
+        let (address, mut server) = start_fd_limited_server().await;
 
-/// One SET/GET round trip with short timeouts; false on any failure.
-async fn try_round_trip(address: &str) -> bool {
-    let attempt = async {
-        let mut client = RawClient::from_stream(TcpStream::connect(address).await.ok()?);
-        client
-            .writer
-            .write_all(&encode(&[b"SET", b"health", b"check"]))
-            .await
-            .ok()?;
-        read_reply(&mut client.reader).await.ok()
-    };
-    matches!(timeout(Duration::from_secs(1), attempt).await, Ok(Some(reply)) if reply == ok())
-}
+        // Hold more connections than the fd limit allows the server to accept.
+        let mut flood = Vec::new();
+        for _ in 0..64 {
+            if let Ok(stream) = TcpStream::connect(&address).await {
+                flood.push(stream);
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
 
-#[tokio::test]
-async fn server_survives_running_out_of_file_descriptors() {
-    if external_target().is_some() {
-        eprintln!("skipped: this test starts this project's own server binary");
-        return;
-    }
-    let (address, mut server) = start_fd_limited_server().await;
-
-    // Hold more connections than the fd limit allows the server to accept.
-    let mut flood = Vec::new();
-    for _ in 0..64 {
+        // Prove accept() is failing: a late client is queued by the kernel but never served.
         if let Ok(stream) = TcpStream::connect(&address).await {
-            flood.push(stream);
+            let mut late = RawClient::from_stream(stream);
+            late.send(&[b"GET", b"k"]).await;
+            late.assert_no_reply_within(Duration::from_millis(500))
+                .await;
         }
-    }
-    sleep(Duration::from_millis(500)).await;
 
-    // Prove accept() is failing: a late client is queued by the kernel but never served.
-    if let Ok(stream) = TcpStream::connect(&address).await {
-        let mut late = RawClient::from_stream(stream);
-        late.send(&[b"GET", b"k"]).await;
-        late.assert_no_reply_within(Duration::from_millis(500))
-            .await;
-    }
-
-    assert!(
-        server.0.try_wait().unwrap().is_none(),
-        "server process exited after accept() failed"
-    );
-
-    // Once fds are free again the server must recover within 10s. A retry
-    // backoff longer than that (e.g. doubling up to 64s) fails this test on purpose.
-    drop(flood);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !try_round_trip(&address).await {
         assert!(
             server.0.try_wait().unwrap().is_none(),
             "server process exited after accept() failed"
         );
-        assert!(
-            Instant::now() < deadline,
-            "server did not serve new clients within 10s of fds being freed"
-        );
-        sleep(Duration::from_millis(100)).await;
+
+        // Once fds are free again the server must recover within 10s. A retry
+        // backoff longer than that (e.g. doubling up to 64s) fails this test on purpose.
+        drop(flood);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !try_round_trip(&address).await {
+            assert!(
+                server.0.try_wait().unwrap().is_none(),
+                "server process exited after accept() failed"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "server did not serve new clients within 10s of fds being freed"
+            );
+            sleep(Duration::from_millis(100)).await;
+        }
     }
 }
 
