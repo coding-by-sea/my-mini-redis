@@ -3,18 +3,21 @@
 //! order they were published, and a slow subscriber never blocks a publisher.
 
 use crate::State;
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{Notify, mpsc};
 
 /// Redis's default `client-output-buffer-limit pubsub` hard limit. A subscriber with
-/// more than this queued is disconnected rather than buffered without bound.
+/// more than this queued (counted in encoded bytes, as Redis counts its output
+/// buffer) is disconnected rather than buffered without bound.
 pub(crate) const QUEUE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 
-/// A published message: `(channel, payload)`.
-pub(crate) type Message = (Bytes, Bytes);
+/// A published message, already encoded as the RESP `[message, channel, payload]` push
+/// a subscriber receives. It is encoded once per PUBLISH and shared by every
+/// subscriber's queue.
+pub(crate) type Message = Bytes;
 
 /// The sending side of a connection's message queue, stored in the channel registry.
 #[derive(Clone)]
@@ -32,18 +35,18 @@ struct Shared {
 impl Mailbox {
     /// Queues a message. Over the limit, the message is dropped and the connection is
     /// told to close instead.
-    fn deliver(&self, channel: &Bytes, payload: &Bytes) {
+    fn deliver(&self, message: &Message) {
         if self.shared.overflowed.load(Ordering::Relaxed) {
             return;
         }
-        let size = channel.len() + payload.len();
+        let size = message.len();
         if self.shared.queued_bytes.fetch_add(size, Ordering::Relaxed) + size > QUEUE_LIMIT_BYTES {
             self.shared.overflowed.store(true, Ordering::Relaxed);
             self.shared.overflow.notify_one();
             return;
         }
         // Fails only once the connection is gone; its cleanup removes this mailbox.
-        let _ = self.sender.send((channel.clone(), payload.clone()));
+        let _ = self.sender.send(message.clone());
     }
 }
 
@@ -53,10 +56,23 @@ pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes) -> usize 
     let Some(subscribers) = state.subscribers.get(channel) else {
         return 0;
     };
+    let message = encode_message(channel, payload);
     for mailbox in subscribers.values() {
-        mailbox.deliver(channel, payload);
+        mailbox.deliver(&message);
     }
     subscribers.len()
+}
+
+/// Encodes `*3\r\n$7\r\nmessage\r\n$<len>\r\n<channel>\r\n$<len>\r\n<payload>\r\n`.
+fn encode_message(channel: &[u8], payload: &[u8]) -> Message {
+    let mut out = BytesMut::with_capacity(channel.len() + payload.len() + 48);
+    out.put_slice(b"*3\r\n$7\r\nmessage\r\n");
+    for part in [channel, payload] {
+        out.put_slice(format!("${}\r\n", part.len()).as_bytes());
+        out.put_slice(part);
+        out.put_slice(b"\r\n");
+    }
+    out.freeze()
 }
 
 /// One connection's subscriptions and the receiving side of its message queue.
@@ -127,8 +143,9 @@ impl Subscriptions {
         channels
     }
 
-    /// Takes the messages already queued, without waiting. Call it while holding the
-    /// db lock to get exactly the messages published before this point.
+    /// Takes the messages already queued, without waiting. Called while holding the db
+    /// lock, the result is exactly the messages published before this point, which
+    /// matters when the caller also changes subscriptions.
     pub(crate) fn take_queued(&mut self) -> Vec<Message> {
         let mut messages = Vec::new();
         while let Ok(message) = self.receiver.try_recv() {
@@ -152,11 +169,11 @@ impl Subscriptions {
         OverflowSignal(self.mailbox.shared.clone())
     }
 
-    fn dequeued(&self, (channel, payload): &Message) {
+    fn dequeued(&self, message: &Message) {
         self.mailbox
             .shared
             .queued_bytes
-            .fetch_sub(channel.len() + payload.len(), Ordering::Relaxed);
+            .fetch_sub(message.len(), Ordering::Relaxed);
     }
 }
 

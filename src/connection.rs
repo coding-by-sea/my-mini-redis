@@ -22,7 +22,9 @@ pub(crate) enum ReadRequestError {
 impl Connection {
     pub fn new(stream: TcpStream) -> Connection {
         Connection {
-            stream: BufWriter::new(stream),
+            // Large enough to hold the replies to a typical pipelined batch, so they
+            // go out in one write.
+            stream: BufWriter::with_capacity(64 * 1024, stream),
             buffer: BytesMut::with_capacity(4096),
         }
     }
@@ -49,15 +51,11 @@ impl Connection {
     /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
     pub(crate) async fn read_request(&mut self) -> Result<Option<Vec<Bytes>>, ReadRequestError> {
         loop {
-            match request::parse(&self.buffer).map_err(ReadRequestError::Protocol)? {
-                Parsed::Request { args, consumed } => {
-                    self.buffer.advance(consumed);
-                    if !args.is_empty() {
-                        return Ok(Some(args));
-                    }
-                    continue;
-                }
-                Parsed::Incomplete => {}
+            if let Some(args) = self
+                .buffered_request()
+                .map_err(ReadRequestError::Protocol)?
+            {
+                return Ok(Some(args));
             }
             let read = self
                 .stream
@@ -67,6 +65,23 @@ impl Connection {
             if read == 0 {
                 // A request cut off by the client closing has nobody left to answer.
                 return Ok(None);
+            }
+        }
+    }
+
+    /// Returns the next request that has already been received in full, without
+    /// reading from the socket. Requests Redis ignores, such as empty arrays, are
+    /// skipped.
+    pub(crate) fn buffered_request(&mut self) -> Result<Option<Vec<Bytes>>, ProtocolError> {
+        loop {
+            match request::parse(&self.buffer)? {
+                Parsed::Request { args, consumed } => {
+                    self.buffer.advance(consumed);
+                    if !args.is_empty() {
+                        return Ok(Some(args));
+                    }
+                }
+                Parsed::Incomplete => return Ok(None),
             }
         }
     }
@@ -94,6 +109,24 @@ impl Connection {
         } else {
             Ok(())
         }
+    }
+
+    /// Adds a frame to the write buffer without sending it; call `flush` to send.
+    /// The buffer is also written out whenever it fills up.
+    pub(crate) async fn buffer_frame(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
+        self.write_value(frame).await
+    }
+
+    /// Adds already encoded RESP bytes to the write buffer without sending them.
+    pub(crate) async fn buffer_encoded(&mut self, bytes: &[u8]) -> Result<(), anyhow::Error> {
+        self.stream.write_all(bytes).await?;
+        Ok(())
+    }
+
+    /// Sends everything buffered.
+    pub(crate) async fn flush(&mut self) -> Result<(), anyhow::Error> {
+        self.stream.flush().await?;
+        Ok(())
     }
 
     async fn write_value(&mut self, frame: Frame) -> Result<(), anyhow::Error> {

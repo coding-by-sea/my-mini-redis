@@ -163,6 +163,25 @@ There is no standalone `unsubscribe` command: subscriptions belong to a connecti
 export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
 ```
 
+### Benchmarking against Redis
+
+```bash
+brew install redis              # or: apt install redis-server (needed for the comparison)
+scripts/bench.sh                # full run, about 4 minutes
+scripts/bench.sh --quick        # summary and memory only
+scripts/bench.sh --help         # all options
+```
+
+[`benches/load.rs`](benches/load.rs) starts my-mini-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
+
+- **Summary:** PING, SET, GET and PUBLISH (raw and pipelined), SET and GET through the `Client` library, and pub/sub fan-out. Each scenario has its throughput relative to Redis, p50/p90/p99/p99.9/max latency, server CPU per operation, cores used and peak memory.
+- **Memory:** idle footprint, memory per connection, and memory per key.
+- **Sweeps:** pipeline depth, number of connections, payload size and pub/sub fan-out, each varied on its own.
+- **Single-threaded:** my-mini-redis on one worker thread against Redis, which also runs commands on one thread.
+- **Load generator CPU and observations:** how much CPU the benchmark itself used, and notes computed from the data that point to where to optimize.
+
+You can also run it from the Actions tab (the `bench` workflow), which adds the report to the job summary.
+
 ---
 
 ## 🚧 Work in Progress

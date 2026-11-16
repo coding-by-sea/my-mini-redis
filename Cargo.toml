@@ -18,3 +18,7 @@ path = "src/bin/client.rs"
 [[bin]]
 name = "my-mini-redis-server"
 path = "src/bin/server.rs"
+
+[[bench]]
+name = "load"
+harness = false

@@ -68,27 +68,43 @@ impl Server {
         loop {
             tokio::select! {
                 request = connection.read_request() => {
-                    let args = match request {
+                    let mut args = match request {
                         Ok(Some(args)) => args,
                         Ok(None) => return Ok(()),
-                        Err(ReadRequestError::Protocol(ProtocolError(message))) => {
-                            connection
-                                .write_frame(error_frame(format!("ERR Protocol error: {message}")))
-                                .await?;
-                            return Ok(());
+                        Err(ReadRequestError::Protocol(error)) => {
+                            return protocol_error(&mut connection, error).await;
                         }
                         Err(ReadRequestError::Io(error)) => return Err(error),
                     };
-                    let (replies, next) = session.execute(args);
-                    for reply in replies {
-                        connection.write_frame(reply).await?;
+                    // Run every request that has already arrived, then send all the
+                    // replies with one write instead of one per reply.
+                    loop {
+                        let (messages, replies, next) = session.execute(args);
+                        for message in messages {
+                            connection.buffer_encoded(&message).await?;
+                        }
+                        for reply in replies {
+                            connection.buffer_frame(reply).await?;
+                        }
+                        if let Next::Close = next {
+                            connection.flush().await?;
+                            return Ok(());
+                        }
+                        match connection.buffered_request() {
+                            Ok(Some(more)) => args = more,
+                            Ok(None) => break,
+                            Err(error) => return protocol_error(&mut connection, error).await,
+                        }
                     }
-                    if let Next::Close = next {
-                        return Ok(());
-                    }
+                    connection.flush().await?;
                 }
                 message = session.subscriptions.next_message() => {
-                    connection.write_frame(message_frame(message)).await?;
+                    // Send this message and everything else already queued in one write.
+                    connection.buffer_encoded(&message).await?;
+                    for message in session.subscriptions.take_queued() {
+                        connection.buffer_encoded(&message).await?;
+                    }
+                    connection.flush().await?;
                 }
                 () = overflow.wait() => {
                     anyhow::bail!(
@@ -121,52 +137,49 @@ impl Session {
         }
     }
 
-    /// Runs one request and returns the frames to send, in order.
-    fn execute(&mut self, args: Vec<Bytes>) -> (Vec<Frame>, Next) {
-        let mut state = lock(&self.db);
-        // Messages published before this command go out before its reply, as in Redis.
-        // Taking them under the lock means none can slip in between.
-        let mut replies: Vec<Frame> = self
-            .subscriptions
-            .take_queued()
-            .into_iter()
-            .map(message_frame)
-            .collect();
-
+    /// Runs one request. Returns the messages already queued for this connection,
+    /// which go out before the replies as in Redis, then the replies.
+    ///
+    /// The db lock is only held for the step of a command that reads or changes
+    /// shared state. SUBSCRIBE, UNSUBSCRIBE and RESET also take the queued messages
+    /// under the lock, so that no message for a channel can arrive after its
+    /// unsubscribe acknowledgment. For other commands it is enough to take what is
+    /// queued when the command runs: a PUBLISH that finished earlier has already
+    /// queued its message, and one running concurrently may land on either side, as
+    /// in Redis.
+    fn execute(&mut self, args: Vec<Bytes>) -> (Vec<Message>, Vec<Frame>, Next) {
         let command = match Command::from_args(args) {
             Ok(command) => command,
-            Err(message) => {
-                replies.push(error_frame(message));
-                return (replies, Next::Continue);
-            }
+            Err(message) => return self.reply(vec![error_frame(message)], Next::Continue),
         };
         if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
-            replies.push(error_frame(format!(
+            let error = error_frame(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                 command.name()
-            )));
-            return (replies, Next::Continue);
+            ));
+            return self.reply(vec![error], Next::Continue);
         }
 
         match command {
             Command::Get(cmd) => {
-                replies.push(
-                    state
-                        .entries
-                        .get(cmd.key())
-                        .cloned()
-                        .map_or(Frame::Null, Frame::Bulk),
-                );
+                let value = lock(&self.db).entries.get(cmd.key()).cloned();
+                self.reply(vec![value.map_or(Frame::Null, Frame::Bulk)], Next::Continue)
             }
             Command::Set(cmd) => {
-                state.entries.insert(cmd.key().clone(), cmd.value());
-                replies.push(Frame::Simple("OK".into()));
+                lock(&self.db)
+                    .entries
+                    .insert(cmd.key().clone(), cmd.value());
+                self.reply(vec![Frame::Simple("OK".into())], Next::Continue)
             }
             Command::Publish(cmd) => {
-                let receivers = subscription::publish(&state, cmd.channel(), cmd.message());
-                replies.push(Frame::Integer(receivers as i64));
+                let receivers =
+                    subscription::publish(&lock(&self.db), cmd.channel(), cmd.message());
+                self.reply(vec![Frame::Integer(receivers as i64)], Next::Continue)
             }
             Command::Subscribe(cmd) => {
+                let mut state = lock(&self.db);
+                let messages = self.subscriptions.take_queued();
+                let mut replies = Vec::with_capacity(cmd.channels().len());
                 for channel in cmd.channels() {
                     self.subscriptions.subscribe(&mut state, channel.clone());
                     replies.push(push_frame(
@@ -175,13 +188,17 @@ impl Session {
                         self.subscriptions.count(),
                     ));
                 }
+                (messages, replies, Next::Continue)
             }
             Command::Unsubscribe(cmd) => {
+                let mut state = lock(&self.db);
+                let messages = self.subscriptions.take_queued();
                 let channels = if cmd.channels().is_empty() {
                     self.subscriptions.channels()
                 } else {
                     cmd.channels().to_vec()
                 };
+                let mut replies = Vec::with_capacity(channels.len().max(1));
                 if channels.is_empty() {
                     replies.push(push_frame("unsubscribe", Frame::Null, 0));
                 }
@@ -193,25 +210,37 @@ impl Session {
                         self.subscriptions.count(),
                     ));
                 }
+                (messages, replies, Next::Continue)
             }
-            Command::Ping(message) => replies.push(if self.subscriptions.is_empty() {
-                message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
-            } else {
-                Frame::Array(vec![
-                    Frame::Bulk(Bytes::from_static(b"pong")),
-                    Frame::Bulk(message.unwrap_or_default()),
-                ])
-            }),
-            Command::Quit => {
-                replies.push(Frame::Simple("OK".into()));
-                return (replies, Next::Close);
+            Command::Ping(message) => {
+                let pong = if self.subscriptions.is_empty() {
+                    message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
+                } else {
+                    Frame::Array(vec![
+                        Frame::Bulk(Bytes::from_static(b"pong")),
+                        Frame::Bulk(message.unwrap_or_default()),
+                    ])
+                };
+                self.reply(vec![pong], Next::Continue)
             }
+            Command::Quit => self.reply(vec![Frame::Simple("OK".into())], Next::Close),
             Command::Reset => {
+                let mut state = lock(&self.db);
+                let messages = self.subscriptions.take_queued();
                 self.subscriptions.unsubscribe_all(&mut state);
-                replies.push(Frame::Simple("RESET".into()));
+                (
+                    messages,
+                    vec![Frame::Simple("RESET".into())],
+                    Next::Continue,
+                )
             }
         }
-        (replies, Next::Continue)
+    }
+
+    /// Pairs `replies` with the messages queued so far, taken without the db lock,
+    /// for commands that don't change subscriptions (see `execute`).
+    fn reply(&mut self, replies: Vec<Frame>, next: Next) -> (Vec<Message>, Vec<Frame>, Next) {
+        (self.subscriptions.take_queued(), replies, next)
     }
 }
 
@@ -236,12 +265,16 @@ fn push_frame(kind: &'static str, channel: Frame, count: usize) -> Frame {
     ])
 }
 
-fn message_frame((channel, payload): Message) -> Frame {
-    Frame::Array(vec![
-        Frame::Bulk(Bytes::from_static(b"message")),
-        Frame::Bulk(channel),
-        Frame::Bulk(payload),
-    ])
+/// Replies with a protocol error, sending any replies already buffered first, then
+/// closes the connection by returning.
+async fn protocol_error(
+    connection: &mut Connection,
+    ProtocolError(message): ProtocolError,
+) -> anyhow::Result<()> {
+    connection
+        .buffer_frame(error_frame(format!("ERR Protocol error: {message}")))
+        .await?;
+    connection.flush().await
 }
 
 #[cfg(test)]
