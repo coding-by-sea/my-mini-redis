@@ -127,8 +127,9 @@ impl Subscriptions {
         channels
     }
 
-    /// Takes the messages already queued, without waiting. Call it while holding the
-    /// db lock to get exactly the messages published before this point.
+    /// Takes the messages already queued, without waiting. Called while holding the db
+    /// lock, the result is exactly the messages published before this point, which
+    /// matters when the caller also changes subscriptions.
     pub(crate) fn take_queued(&mut self) -> Vec<Message> {
         let mut messages = Vec::new();
         while let Ok(message) = self.receiver.try_recv() {

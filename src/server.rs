@@ -116,25 +116,26 @@ impl Session {
     }
 
     /// Runs one request and returns the frames to send, in order.
+    ///
+    /// Messages already queued for this connection go out before the reply, as in
+    /// Redis. The db lock is only held for the step of a command that reads or
+    /// changes shared state. SUBSCRIBE, UNSUBSCRIBE and RESET also take the queued
+    /// messages under the lock, so that no message for a channel can arrive after
+    /// its unsubscribe acknowledgment. For other commands it is enough to take what
+    /// is queued when the command runs: a PUBLISH that finished earlier has already
+    /// queued its message, and one running concurrently may land on either side,
+    /// as in Redis.
     fn execute(&mut self, args: Vec<Bytes>) -> (Vec<Frame>, Next) {
-        let mut state = lock(&self.db);
-        // Messages published before this command go out before its reply, as in Redis.
-        // Taking them under the lock means none can slip in between.
-        let mut replies: Vec<Frame> = self
-            .subscriptions
-            .take_queued()
-            .into_iter()
-            .map(message_frame)
-            .collect();
-
         let command = match Command::from_args(args) {
             Ok(command) => command,
             Err(message) => {
+                let mut replies = queued_frames(&mut self.subscriptions);
                 replies.push(error_frame(message));
                 return (replies, Next::Continue);
             }
         };
         if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
+            let mut replies = queued_frames(&mut self.subscriptions);
             replies.push(error_frame(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                 command.name()
@@ -144,23 +145,29 @@ impl Session {
 
         match command {
             Command::Get(cmd) => {
-                replies.push(
-                    state
-                        .entries
-                        .get(cmd.key())
-                        .cloned()
-                        .map_or(Frame::Null, Frame::Bulk),
-                );
+                let mut replies = queued_frames(&mut self.subscriptions);
+                let value = lock(&self.db).entries.get(cmd.key()).cloned();
+                replies.push(value.map_or(Frame::Null, Frame::Bulk));
+                (replies, Next::Continue)
             }
             Command::Set(cmd) => {
-                state.entries.insert(cmd.key().clone(), cmd.value());
+                let mut replies = queued_frames(&mut self.subscriptions);
+                lock(&self.db)
+                    .entries
+                    .insert(cmd.key().clone(), cmd.value());
                 replies.push(Frame::Simple("OK".into()));
+                (replies, Next::Continue)
             }
             Command::Publish(cmd) => {
-                let receivers = subscription::publish(&state, cmd.channel(), cmd.message());
+                let mut replies = queued_frames(&mut self.subscriptions);
+                let receivers =
+                    subscription::publish(&lock(&self.db), cmd.channel(), cmd.message());
                 replies.push(Frame::Integer(receivers as i64));
+                (replies, Next::Continue)
             }
             Command::Subscribe(cmd) => {
+                let mut state = lock(&self.db);
+                let mut replies = queued_frames(&mut self.subscriptions);
                 for channel in cmd.channels() {
                     self.subscriptions.subscribe(&mut state, channel.clone());
                     replies.push(push_frame(
@@ -169,8 +176,11 @@ impl Session {
                         self.subscriptions.count(),
                     ));
                 }
+                (replies, Next::Continue)
             }
             Command::Unsubscribe(cmd) => {
+                let mut state = lock(&self.db);
+                let mut replies = queued_frames(&mut self.subscriptions);
                 let channels = if cmd.channels().is_empty() {
                     self.subscriptions.channels()
                 } else {
@@ -187,26 +197,43 @@ impl Session {
                         self.subscriptions.count(),
                     ));
                 }
+                (replies, Next::Continue)
             }
-            Command::Ping(message) => replies.push(if self.subscriptions.is_empty() {
-                message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
-            } else {
-                Frame::Array(vec![
-                    Frame::Bulk(Bytes::from_static(b"pong")),
-                    Frame::Bulk(message.unwrap_or_default()),
-                ])
-            }),
+            Command::Ping(message) => {
+                let mut replies = queued_frames(&mut self.subscriptions);
+                replies.push(if self.subscriptions.is_empty() {
+                    message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
+                } else {
+                    Frame::Array(vec![
+                        Frame::Bulk(Bytes::from_static(b"pong")),
+                        Frame::Bulk(message.unwrap_or_default()),
+                    ])
+                });
+                (replies, Next::Continue)
+            }
             Command::Quit => {
+                let mut replies = queued_frames(&mut self.subscriptions);
                 replies.push(Frame::Simple("OK".into()));
-                return (replies, Next::Close);
+                (replies, Next::Close)
             }
             Command::Reset => {
+                let mut state = lock(&self.db);
+                let mut replies = queued_frames(&mut self.subscriptions);
                 self.subscriptions.unsubscribe_all(&mut state);
                 replies.push(Frame::Simple("RESET".into()));
+                (replies, Next::Continue)
             }
         }
-        (replies, Next::Continue)
     }
+}
+
+/// The messages already queued for a connection, as frames to send.
+fn queued_frames(subscriptions: &mut Subscriptions) -> Vec<Frame> {
+    subscriptions
+        .take_queued()
+        .into_iter()
+        .map(message_frame)
+        .collect()
 }
 
 impl Drop for Session {
