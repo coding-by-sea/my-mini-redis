@@ -1000,7 +1000,7 @@ async fn raw(
                 }
                 window.record(&mut stats, started, load.pipeline as u64);
             }
-            anyhow::Ok(stats)
+            Ok::<_, anyhow::Error>(stats)
         }));
     }
     join(workers).await
@@ -1036,7 +1036,7 @@ async fn with_client(
                 }
                 window.record(&mut stats, started, 1);
             }
-            anyhow::Ok(stats)
+            Ok::<_, anyhow::Error>(stats)
         }));
     }
     join(workers).await
@@ -1097,7 +1097,7 @@ async fn pubsub(
                     stats.latency.record(sent.elapsed().as_nanos() as u64);
                 }
             }
-            anyhow::Ok((stats, disconnected))
+            Ok::<_, anyhow::Error>((stats, disconnected))
         }));
     }
 
@@ -1127,7 +1127,7 @@ async fn pubsub(
                 published.fetch_add(load.pipeline as u64, Ordering::AcqRel);
                 window.record(&mut stats, started, load.pipeline as u64);
             }
-            anyhow::Ok(stats)
+            Ok::<_, anyhow::Error>(stats)
         }));
     }
 
@@ -1774,8 +1774,11 @@ impl Bench {
                 .filter_map(|mini| {
                     let other = Derived::new(self.find("summary", &mini.label, redis)?);
                     let a = Derived::new(mini);
-                    (other.ops_per_sec > 0.0)
-                        .then(|| (a.ops_per_sec / other.ops_per_sec, mini, other))
+                    (other.ops_per_sec > 0.0).then_some((
+                        a.ops_per_sec / other.ops_per_sec,
+                        mini,
+                        other,
+                    ))
                 })
                 .collect();
             ratios.sort_by(|a, b| a.0.total_cmp(&b.0));
