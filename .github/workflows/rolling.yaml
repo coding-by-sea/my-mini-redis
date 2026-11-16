@@ -1,0 +1,43 @@
+name: rolling
+
+# Early warning for breakage that doesn't come from this repository: upcoming
+# compiler changes (nightly) and new dependency releases (beta with `cargo update`).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "7 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  nightly:
+    name: ubuntu / nightly
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo test --all-targets --locked
+
+  updated:
+    name: ubuntu / beta / updated
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@beta
+      - run: cargo update
+      - run: cargo test --all-targets --locked
+        env:
+          RUSTFLAGS: -D deprecated
