@@ -42,6 +42,12 @@ impl Server {
                     continue;
                 }
             };
+            // Send replies immediately, as Redis does. With Nagle's algorithm on, a
+            // small reply written while an earlier one is unacknowledged waits for the
+            // client's delayed ACK (40 ms on Linux), stalling pipelined clients.
+            if let Err(error) = socket.set_nodelay(true) {
+                eprintln!("ERROR setting TCP_NODELAY: {error}");
+            }
             let db = self.db.clone();
             tokio::spawn(async move {
                 if let Err(error) = Server::handle(socket, db).await {

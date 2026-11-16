@@ -1262,3 +1262,33 @@ async fn subscriber_over_the_output_buffer_limit_is_disconnected() {
     publisher.assert_usable().await;
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// 1.17 Pipelined replies are sent without delay
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pipelined_replies_are_not_delayed() {
+    let (address, server) = start_server().await;
+    let mut client = RawClient::connect(&address).await;
+
+    // Redis sets TCP_NODELAY on client sockets. Without it, Nagle's algorithm holds a
+    // small reply written while an earlier one is unacknowledged until the client's
+    // delayed ACK, 40 ms on Linux, so each pipelined round trip stalls.
+    const ROUNDS: u32 = 20;
+    let mut batch = encode(&[b"PING"]);
+    batch.extend(encode(&[b"PING"]));
+    let started = Instant::now();
+    for _ in 0..ROUNDS {
+        client.send_raw(&batch).await;
+        assert_eq!(client.read().await, Reply::Simple("PONG".into()));
+        assert_eq!(client.read().await, Reply::Simple("PONG".into()));
+    }
+    let elapsed = started.elapsed();
+    // Normally well under a millisecond per round; stalled, about 40 ms per round.
+    assert!(
+        elapsed < Duration::from_millis(10) * ROUNDS,
+        "{ROUNDS} pipelined round trips took {elapsed:?}"
+    );
+    server.abort();
+}

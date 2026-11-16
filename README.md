@@ -190,7 +190,7 @@ my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE
 
 ### Redis wire compatibility
 
-[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 33 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining, slow subscribers and running out of file descriptors. 3 more tests in `src/server.rs` cover pub/sub channel cleanup. All of them pass.
+[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 34 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining (including Nagle stalls), slow subscribers and running out of file descriptors. 3 more tests in `src/server.rs` cover pub/sub channel cleanup. All of them pass.
 
 The test expectations are themselves checked against a real Redis: CI's `redis-compat` job runs them against Redis 7.2.5 on every pull request, and all pass there (the file-descriptor test skips itself in that mode). To run that check locally:
 
@@ -237,7 +237,7 @@ cargo test --test redis_compat
 
 - **20 Unit Tests**: RESP frame encoding/decoding, request parsing (RESP and inline), and 3 pub/sub channel-cleanup tests
 - **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
-- **33 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, 30 of them verified against Redis 7.2.5
+- **34 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, run against Redis 7.2.5 in CI
 - **4 CLI Parsing Tests**: Clap argument validation
 
 
