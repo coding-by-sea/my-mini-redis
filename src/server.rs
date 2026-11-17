@@ -63,9 +63,9 @@ impl Server {
     /// error reply and the connection stays open; malformed RESP gets a protocol
     /// error and closes the connection; I/O failures close it and are returned.
     async fn handle(socket: TcpStream, db: Db) -> anyhow::Result<()> {
-        let socket = Arc::new(socket);
-        let mut reader = RequestReader::new(socket.clone());
-        let mut session = Session::new(db, Outbox::new(socket));
+        let (read, write) = socket.into_split();
+        let mut reader = RequestReader::new(read);
+        let mut session = Session::new(db, Outbox::new(Arc::new(write)));
 
         loop {
             tokio::select! {

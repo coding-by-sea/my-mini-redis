@@ -4,9 +4,9 @@ use super::request::{self, Parsed, ProtocolError};
 use anyhow;
 use bytes::{Buf, Bytes, BytesMut};
 use std::io::{Cursor, Error, ErrorKind};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
 
 /// Space for the first read of a request batch.
 const READ_SIZE: usize = 4096;
@@ -20,10 +20,12 @@ pub struct Connection {
     buffer: BytesMut,
 }
 
-/// The server's reading side of a connection. The socket is shared with the
-/// connection's outbox, which does the writing.
+/// The server's reading side of a connection; the connection's outbox has the
+/// writing side.
 pub(crate) struct RequestReader {
-    socket: Arc<TcpStream>,
+    // Read through `AsyncRead`, which assumes the socket is drained after a short read,
+    // instead of `readable` and `try_read`, which cost a second `recvfrom` per request.
+    socket: OwnedReadHalf,
     buffer: BytesMut,
     /// Space reserved for the next read, between `READ_SIZE` and `MAX_READ_SIZE`.
     read_size: usize,
@@ -143,7 +145,7 @@ impl Connection {
 }
 
 impl RequestReader {
-    pub(crate) fn new(socket: Arc<TcpStream>) -> Self {
+    pub(crate) fn new(socket: OwnedReadHalf) -> Self {
         Self {
             socket,
             buffer: BytesMut::with_capacity(READ_SIZE),
@@ -154,7 +156,7 @@ impl RequestReader {
     /// Reads the next client request. Returns `Ok(None)` once the client closes the
     /// connection. Requests Redis ignores, such as empty arrays, are skipped.
     ///
-    /// Cancel safe: it only awaits readiness, so dropping it loses no data.
+    /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
     pub(crate) async fn read_request(&mut self) -> Result<Option<Vec<Bytes>>, ReadRequestError> {
         let io_error = |error: std::io::Error| ReadRequestError::Io(error.into());
         loop {
@@ -167,18 +169,11 @@ impl RequestReader {
             // Parsed arguments are copied out, so this reuses the consumed space.
             self.buffer.reserve(self.read_size);
             let space = self.buffer.capacity() - self.buffer.len();
-            let read = loop {
-                self.socket.readable().await.map_err(io_error)?;
-                match self.socket.try_read_buf(&mut self.buffer) {
-                    Ok(read) => break read,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            ErrorKind::WouldBlock | ErrorKind::Interrupted
-                        ) => {}
-                    Err(error) => return Err(io_error(error)),
-                }
-            };
+            let read = self
+                .socket
+                .read_buf(&mut self.buffer)
+                .await
+                .map_err(io_error)?;
             if read == 0 {
                 // A request cut off by the client closing has nobody left to answer.
                 return Ok(None);

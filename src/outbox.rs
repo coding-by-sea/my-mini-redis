@@ -26,7 +26,7 @@
 use bytes::{Buf, BytesMut};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::Notify;
 
 /// Redis's default `client-output-buffer-limit pubsub` hard limit. A subscriber with
@@ -42,7 +42,7 @@ const SEND_BUFFER_KEEP_LIMIT: usize = 1024 * 1024;
 pub(crate) struct Outbox(Arc<Shared>);
 
 struct Shared {
-    socket: Arc<TcpStream>,
+    socket: Arc<OwnedWriteHalf>,
     queue: Mutex<Queue>,
     /// Bytes taken from `queue`, being written. Only the token holder locks it, so it
     /// is never contended; it is a lock only to be shareable.
@@ -85,7 +85,7 @@ enum Progress {
 }
 
 impl Outbox {
-    pub(crate) fn new(socket: Arc<TcpStream>) -> Self {
+    pub(crate) fn new(socket: Arc<OwnedWriteHalf>) -> Self {
         Self(Arc::new(Shared {
             socket,
             queue: Mutex::default(),
