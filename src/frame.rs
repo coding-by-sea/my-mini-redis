@@ -1,4 +1,4 @@
-use bytes::{Buf, Bytes};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::fmt;
 use std::fmt::Formatter;
 use std::io::Cursor;
@@ -126,6 +126,40 @@ impl Frame {
         }
     }
 
+    /// Appends the RESP encoding of this frame to `out`.
+    pub(crate) fn encode(&self, out: &mut BytesMut) {
+        match self {
+            Frame::Simple(text) => {
+                out.put_u8(b'+');
+                out.put_slice(text.as_bytes());
+                out.put_slice(b"\r\n");
+            }
+            Frame::Error(text) => {
+                out.put_u8(b'-');
+                out.put_slice(text.as_bytes());
+                out.put_slice(b"\r\n");
+            }
+            Frame::Integer(value) => {
+                out.put_u8(b':');
+                put_decimal(out, *value);
+            }
+            Frame::Bulk(bytes) => {
+                out.put_u8(b'$');
+                put_decimal(out, bytes.len() as i64);
+                out.put_slice(bytes);
+                out.put_slice(b"\r\n");
+            }
+            Frame::Null => out.put_slice(b"$-1\r\n"),
+            Frame::Array(frames) => {
+                out.put_u8(b'*');
+                put_decimal(out, frames.len() as i64);
+                for frame in frames {
+                    frame.encode(out);
+                }
+            }
+        }
+    }
+
     fn get_line<'a>(bytes: &mut Cursor<&'a [u8]>) -> Result<&'a [u8], Error> {
         let start = bytes.position() as usize;
         let array = *bytes.get_ref();
@@ -167,6 +201,13 @@ impl Frame {
         }
         Ok(bytes.get_ref()[bytes.position() as usize])
     }
+}
+
+/// Appends `value` in decimal, then CRLF.
+fn put_decimal(out: &mut BytesMut, value: i64) {
+    use std::fmt::Write;
+    // Writing to a `BytesMut` can't fail.
+    let _ = write!(out, "{value}\r\n");
 }
 
 #[cfg(test)]
@@ -231,6 +272,24 @@ mod tests {
             assert_frame_eq(&actual, &expected);
             assert_eq!(cursor.position(), input.len() as u64);
         }
+    }
+
+    #[test]
+    fn encode_writes_resp() {
+        let frame = Frame::Array(vec![
+            Frame::Simple("OK".into()),
+            Frame::Error("ERR bad".into()),
+            Frame::Integer(-7),
+            Frame::Bulk(Bytes::from_static(b"hi")),
+            Frame::Null,
+            Frame::Array(vec![]),
+        ]);
+        let mut out = bytes::BytesMut::new();
+        frame.encode(&mut out);
+        assert_eq!(
+            &out[..],
+            b"*6\r\n+OK\r\n-ERR bad\r\n:-7\r\n$2\r\nhi\r\n$-1\r\n*0\r\n"
+        );
     }
 
     #[test]

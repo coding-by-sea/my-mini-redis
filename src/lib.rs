@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 pub mod connection;
 pub mod frame;
+mod outbox;
 
 pub mod client;
 pub mod cmd;
@@ -18,7 +19,7 @@ struct State {
     entries: HashMap<Bytes, Bytes>,
     /// Channel -> (connection id -> that connection's outbox). A channel is only present
     /// while it has subscribers.
-    subscribers: HashMap<Bytes, HashMap<u64, subscription::Mailbox>>,
+    subscribers: HashMap<Bytes, HashMap<u64, outbox::Outbox>>,
 }
 type Db = Arc<Mutex<State>>;
 
