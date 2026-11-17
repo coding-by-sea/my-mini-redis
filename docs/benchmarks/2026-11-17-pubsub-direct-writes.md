@@ -92,6 +92,8 @@ At 2,000 subscribers (single runs, load generator likely saturated): 512 gave 16
 
 ## What is left
 
-- Redis merges several publishers' batches into one write per subscriber; here each publisher writes its own batch, about 2x the writes per delivery at 100 subscribers.
-- Pub/sub still runs under the db lock that serializes every SET and GET (SET is at about 0.36x Redis).
-- The benchmark has one channel; many channels and SET mixed with PUBLISH are still to be measured.
+Followed up in [pub/sub lock and fairness](2026-11-17-pubsub-lock-and-fairness.md):
+
+- **Done:** the benchmark measures many channels and SET mixed with PUBLISH. The mixed run showed PUBLISH collapsing to 0.15x Redis under SET load.
+- **Done:** pub/sub has its own lock, and every connection yields after each batch. Together these fixed the collapse.
+- **Tried, not adopted:** merging several publishers' batches into one write per subscriber by yielding before the writes. It saved 8 to 14% of writes, but doubled delivery latency under mixed load.

@@ -73,11 +73,13 @@ Key Technics:
 
 5. **Separate locks for keys and pub/sub**: `GET` and `SET` take the keys' lock; `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` take the pub/sub registry's. A fan-out to many subscribers therefore doesn't hold up key commands, and a burst of `SET`s doesn't starve publishers. Pub/sub keeps one lock rather than one per channel, so every subscriber sees publishes in the same order.
 
-6. **Bounded memory without backpressure**: outboxes never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
+6. **One batch per client at a time**: a connection yields to the scheduler after each batch of pipelined requests, as Redis's event loop serves each client once per pass. Without this, a client whose next batch had already arrived was served batch after batch in one task poll, and other clients' requests waited: publishers stalled for up to seconds, and `PUBLISH` ran at a fifth of its rate next to pipelined `SET`s. A lone request that wrote to nobody else skips the yield, since its client is waiting for the reply anyway.
 
-7. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+7. **Bounded memory without backpressure**: outboxes never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
 
-8. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
+8. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+
+9. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
 
 ---
 
@@ -187,9 +189,9 @@ scripts/bench.sh --help         # all options
 
 [`benches/load.rs`](benches/load.rs) starts my-mini-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
 
-- **Summary:** PING, SET, GET and PUBLISH (raw and pipelined), SET and GET through the `Client` library, and pub/sub fan-out. Each scenario has its throughput relative to Redis, p50/p90/p99/p99.9/max latency, server CPU per operation, cores used and peak memory.
+- **Summary:** PING, SET, GET and PUBLISH (raw and pipelined), SET and GET through the `Client` library, pub/sub fan-out, and pipelined SET running alongside pub/sub. Each scenario has its throughput relative to Redis, p50/p90/p99/p99.9/max latency, server CPU per operation, cores used and peak memory.
 - **Memory:** idle footprint, memory per connection, and memory per key.
-- **Sweeps:** pipeline depth, number of connections, payload size and pub/sub fan-out, each varied on its own.
+- **Sweeps:** pipeline depth, number of connections, payload size, pub/sub fan-out, and the number of channels the subscribers are spread over, each varied on its own.
 - **Single-threaded:** my-mini-redis on one worker thread against Redis, which also runs commands on one thread.
 - **Load generator CPU and observations:** how much CPU the benchmark itself used, and notes computed from the data that point to where to optimize.
 
