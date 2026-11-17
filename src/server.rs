@@ -4,7 +4,7 @@ use crate::frame::Frame;
 use crate::outbox::{Outbox, QUEUE_LIMIT_BYTES};
 use crate::request::ProtocolError;
 use crate::subscription::{self, Subscriptions, Wakes};
-use crate::{DEFAULT_ADDRESS, Db, State, lock};
+use crate::{DEFAULT_ADDRESS, Db, Registry, lock};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -98,18 +98,16 @@ impl Server {
                     // for a full socket comes last, so a client that is slow to read
                     // its replies doesn't hold up its subscribers.
                     session.outbox.write_now();
-                    let wrote_to_others = session.wakes.write_all();
+                    session.wakes.write_all();
                     session.outbox.flush().await?;
-                    // Writing to other clients makes a batch long. While this client's
-                    // next batch is already waiting, the reads above don't yield, so
-                    // without this the task would run batch after batch in one poll
-                    // (until tokio's budget of about 128 runs out), and no other
-                    // worker would collect socket events meanwhile: other clients then
-                    // waited for 100+ ms. Like Redis's event loop, serve each client
-                    // one batch at a time.
-                    if wrote_to_others {
-                        tokio::task::yield_now().await;
-                    }
+                    // Like Redis's event loop, serve each client one batch at a time.
+                    // While a client's next batch is already waiting, the read above
+                    // doesn't yield, so without this the task would run batch after
+                    // batch in one poll (until tokio's budget of about 128 runs out),
+                    // and no other worker would collect socket events meanwhile:
+                    // publishers then waited 100+ ms behind other publishers, and
+                    // PUBLISH ran at a quarter of its rate behind pipelined SETs.
+                    tokio::task::yield_now().await;
                 }
                 () = session.outbox.ready() => {
                     if session.outbox.overflowed() {
@@ -157,8 +155,9 @@ impl Session {
 
     /// Runs one request, encoding its replies.
     ///
-    /// The db lock is only held for the step of a command that reads or changes
-    /// shared state. Messages reach the outbox under the db lock, so SUBSCRIBE,
+    /// A db lock is only held for the step of a command that reads or changes shared
+    /// state: the keys' lock for GET and SET, the pub/sub lock for the rest. Messages
+    /// reach the outbox under the pub/sub lock, so SUBSCRIBE,
     /// UNSUBSCRIBE and RESET move their replies to the outbox before releasing it: a
     /// channel's messages then come after its subscribe acknowledgment and before its
     /// unsubscribe acknowledgment, as in Redis. Other replies of a subscribed
@@ -187,18 +186,16 @@ impl Session {
 
         match command {
             Command::Get(cmd) => {
-                let value = lock(&self.db).entries.get(cmd.key()).cloned();
+                let value = lock(&self.db.entries).get(cmd.key()).cloned();
                 self.reply(value.map_or(Frame::Null, Frame::Bulk), Next::Continue)
             }
             Command::Set(cmd) => {
-                lock(&self.db)
-                    .entries
-                    .insert(cmd.key().clone(), cmd.value());
+                lock(&self.db.entries).insert(cmd.key().clone(), cmd.value());
                 self.reply(Frame::Simple("OK".into()), Next::Continue)
             }
             Command::Publish(cmd) => {
                 let receivers = subscription::publish(
-                    &lock(&self.db),
+                    &lock(&self.db.registry),
                     cmd.channel(),
                     cmd.message(),
                     &mut self.wakes,
@@ -207,9 +204,9 @@ impl Session {
             }
             Command::Subscribe(cmd) => {
                 let db = self.db.clone();
-                let mut state = lock(&db);
+                let mut registry = lock(&db.registry);
                 for channel in cmd.channels() {
-                    self.subscriptions.subscribe(&mut state, channel.clone());
+                    self.subscriptions.subscribe(&mut registry, channel.clone());
                     push_frame(
                         "subscribe",
                         Frame::Bulk(channel.clone()),
@@ -217,12 +214,12 @@ impl Session {
                     )
                     .encode(&mut self.replies);
                 }
-                self.push_replies_locked(&state);
+                self.push_replies_locked(&registry);
                 Next::Continue
             }
             Command::Unsubscribe(cmd) => {
                 let db = self.db.clone();
-                let mut state = lock(&db);
+                let mut registry = lock(&db.registry);
                 let channels = if cmd.channels().is_empty() {
                     self.subscriptions.channels()
                 } else {
@@ -232,7 +229,7 @@ impl Session {
                     push_frame("unsubscribe", Frame::Null, 0).encode(&mut self.replies);
                 }
                 for channel in channels {
-                    self.subscriptions.unsubscribe(&mut state, &channel);
+                    self.subscriptions.unsubscribe(&mut registry, &channel);
                     push_frame(
                         "unsubscribe",
                         Frame::Bulk(channel),
@@ -240,7 +237,7 @@ impl Session {
                     )
                     .encode(&mut self.replies);
                 }
-                self.push_replies_locked(&state);
+                self.push_replies_locked(&registry);
                 Next::Continue
             }
             Command::Ping(message) => {
@@ -257,10 +254,10 @@ impl Session {
             Command::Quit => self.reply(Frame::Simple("OK".into()), Next::Close),
             Command::Reset => {
                 let db = self.db.clone();
-                let mut state = lock(&db);
-                self.subscriptions.unsubscribe_all(&mut state);
+                let mut registry = lock(&db.registry);
+                self.subscriptions.unsubscribe_all(&mut registry);
                 Frame::Simple("RESET".into()).encode(&mut self.replies);
-                self.push_replies_locked(&state);
+                self.push_replies_locked(&registry);
                 Next::Continue
             }
         }
@@ -276,17 +273,17 @@ impl Session {
         self.outbox.push(&mut self.replies);
     }
 
-    /// `push_replies` while holding the db lock, which orders the replies with respect
-    /// to messages; taking the guard makes the caller hold it.
-    fn push_replies_locked(&mut self, _state: &State) {
+    /// `push_replies` while holding the pub/sub lock, which orders the replies with
+    /// respect to messages; taking the guard makes the caller hold it.
+    fn push_replies_locked(&mut self, _registry: &Registry) {
         self.push_replies();
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        let mut state = lock(&self.db);
-        self.subscriptions.unsubscribe_all(&mut state);
+        let mut registry = lock(&self.db.registry);
+        self.subscriptions.unsubscribe_all(&mut registry);
     }
 }
 
@@ -351,7 +348,7 @@ mod tests {
     }
 
     fn channel_count(db: &Db) -> usize {
-        db.lock().unwrap().subscribers.len()
+        db.registry.lock().unwrap().len()
     }
 
     async fn wait_for_channel_count(db: &Db, expected: usize) {

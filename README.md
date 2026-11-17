@@ -9,7 +9,7 @@
 
 This project implements a **Redis server speaking the RESP2 wire protocol** from scratch in Rust, wire-compatible with Redis for the commands it supports (`GET`, `SET` without options, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`):
 
-- **Ordered pub/sub delivery**: one outbox per connection, filled under the db lock, so messages from every channel arrive in publish order
+- **Ordered pub/sub delivery**: one outbox per connection, filled under the pub/sub lock, so messages from every channel arrive in publish order
 - **Batched pub/sub writes**: like Redis, the connection that publishes writes to the subscribers' sockets itself, once per batch of pipelined requests, so each subscriber gets the batch in one write without waking its task
 - **Slow subscribers never block publishers**: messages queue up to Redis's 32 MB pub/sub limit, then the subscriber is disconnected
 - **Redis-compatible request parsing**: RESP arrays and inline commands, with Redis's exact error replies
@@ -49,9 +49,9 @@ Key Technics:
 │  └───────────────────────────────────┬───────────────────────┘  │
 │                                      │ lock                     │
 │  ┌───────────────────────────────────▼───────────────────────┐  │
-│  │              Shared State (Arc<Mutex<State>>)             │  │
-│  │   entries:     HashMap<Bytes, Bytes>                      │  │
-│  │   subscribers: HashMap<channel, HashMap<conn id, Outbox>> │  │
+│  │                 Shared State (Arc<Shared>)                │  │
+│  │   entries:  Mutex<HashMap<Bytes, Bytes>>                  │  │
+│  │   registry: Mutex<HashMap<channel, HashMap<id, Outbox>>>  │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
         Every connection's output goes through its Outbox: a FIFO
@@ -63,19 +63,21 @@ Key Technics:
 
 ### Key Architectural Decisions
 
-1. **One outbox per connection**: `PUBLISH` appends to every subscriber's outbox while holding the db lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
+1. **One outbox per connection**: `PUBLISH` appends to every subscriber's outbox while holding the pub/sub lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
 
-2. **Replies and messages stay in order**: replies and messages go through the same outbox, and `SUBSCRIBE`, `UNSUBSCRIBE` and `RESET` append their acknowledgments while still holding the db lock. A channel's messages therefore come after its subscribe acknowledgment and before its unsubscribe acknowledgment, exactly as in Redis.
+2. **Replies and messages stay in order**: replies and messages go through the same outbox, and `SUBSCRIBE`, `UNSUBSCRIBE` and `RESET` append their acknowledgments while still holding the pub/sub lock. A channel's messages therefore come after its subscribe acknowledgment and before its unsubscribe acknowledgment, exactly as in Redis.
 
-3. **Few, large writes**: after running its whole batch of pipelined requests, a publishing connection writes each subscriber's outbox to its socket itself, outside the db lock, as Redis writes pending clients once per event loop pass. Each subscriber gets the batch in one write, and its task is only woken if its socket is full, or for subscribers beyond the first 512. Sending per message instead gave about 3 messages per write, which made write syscalls the bottleneck (see [the pub/sub deep dive](docs/benchmarks/2026-11-16-pubsub-deep-dive.md)). Reads also grow from 4 KiB up to 64 KiB while they keep filling the buffer, so a pipelined batch runs in few steps.
+3. **Few, large writes**: after running its whole batch of pipelined requests, a publishing connection writes each subscriber's outbox to its socket itself, outside the pub/sub lock, as Redis writes pending clients once per event loop pass. Each subscriber gets the batch in one write, and its task is only woken if its socket is full, or for subscribers beyond the first 512. Sending per message instead gave about 3 messages per write, which made write syscalls the bottleneck (see [the pub/sub deep dive](docs/benchmarks/2026-11-16-pubsub-deep-dive.md)). Reads also grow from 4 KiB up to 64 KiB while they keep filling the buffer, so a pipelined batch runs in few steps.
 
 4. **One writer per socket at a time**: several connections can now write to one socket, so a writer token keeps Redis's rule that a socket has a single writer. Only the token holder writes, from the head of the outbox; everyone else only appends, and the holder sends what they appended before releasing the token. Writers other than the connection's own task never wait: when the socket is full, they hand the token to that task.
 
-5. **Bounded memory without backpressure**: outboxes never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
+5. **Separate locks for keys and pub/sub**: `GET` and `SET` take the keys' lock; `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` take the pub/sub registry's. A fan-out to many subscribers therefore doesn't hold up key commands, and a burst of `SET`s doesn't starve publishers. Pub/sub keeps one lock rather than one per channel, so every subscriber sees publishes in the same order.
 
-6. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+6. **Bounded memory without backpressure**: outboxes never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
 
-7. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
+7. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+
+8. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
 
 ---
 

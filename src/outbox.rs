@@ -13,7 +13,7 @@
 //!   what they appended before it releases the token, which it only does with the
 //!   outbox empty, checked under the lock. So nothing is left without a writer.
 //! - The lock is never held during a syscall: the holder moves the queued bytes to a
-//!   buffer only it uses. Publishers append while holding the db lock, so they must
+//!   buffer only it uses. Publishers append while holding the pub/sub lock, so they must
 //!   never wait behind a `sendto`.
 //! - A writer other than the connection's own task never waits: when the socket is
 //!   full it hands the token to the connection's task, which waits until the socket is
@@ -253,7 +253,7 @@ impl Outbox {
     }
 
     /// The lock is never held across anything that can panic, so poisoning is ignored
-    /// as for the db lock.
+    /// as for the db locks.
     fn queue(&self) -> MutexGuard<'_, Queue> {
         self.0
             .queue

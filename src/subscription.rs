@@ -1,5 +1,5 @@
 //! Pub/sub delivery. PUBLISH appends each message to the outbox of every subscriber
-//! while holding the db lock, so messages from every channel reach a subscriber in the
+//! while holding the pub/sub lock, so messages from every channel reach a subscriber in the
 //! order they were published, and a slow subscriber never blocks a publisher.
 //!
 //! Like Redis's "clients pending write", a publisher doesn't send per message: it notes
@@ -8,7 +8,7 @@
 //! then gets the batch with one write, and its task isn't woken unless its socket is
 //! full.
 
-use crate::State;
+use crate::Registry;
 use crate::outbox::Outbox;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashSet;
@@ -24,15 +24,14 @@ const INLINE_WRITE_LIMIT: usize = 512;
 
 /// Subscribers a publisher has queued messages for and still has to send them to.
 /// Sending after the publisher's batch, instead of per message, lets each subscriber
-/// get the whole batch with one write, and keeps the writes outside the db lock.
+/// get the whole batch with one write, and keeps the writes outside the pub/sub lock.
 #[derive(Default)]
 pub(crate) struct Wakes(Vec<Outbox>);
 
 impl Wakes {
     /// Writes the first subscribers' outboxes without waiting, and wakes the tasks of
-    /// the rest, and of any whose socket is full. Returns whether there were any.
-    pub(crate) fn write_all(&mut self) -> bool {
-        let any = !self.0.is_empty();
+    /// the rest, and of any whose socket is full.
+    pub(crate) fn write_all(&mut self) {
         for (index, outbox) in self.0.drain(..).enumerate() {
             if index < INLINE_WRITE_LIMIT {
                 outbox.write_now();
@@ -40,7 +39,6 @@ impl Wakes {
                 outbox.wake();
             }
         }
-        any
     }
 }
 
@@ -54,8 +52,13 @@ impl Drop for Wakes {
 /// Queues `payload` for every subscriber of `channel` and returns how many there were.
 /// The subscribers to send to are added to `wakes`. Never creates a registry entry for
 /// a channel without subscribers.
-pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes, wakes: &mut Wakes) -> usize {
-    let Some(subscribers) = state.subscribers.get(channel) else {
+pub(crate) fn publish(
+    registry: &Registry,
+    channel: &Bytes,
+    payload: &Bytes,
+    wakes: &mut Wakes,
+) -> usize {
+    let Some(subscribers) = registry.get(channel) else {
         return 0;
     };
     let message = encode_message(channel, payload);
@@ -111,10 +114,9 @@ impl Subscriptions {
     }
 
     /// Subscribes to `channel`; subscribing twice has no extra effect.
-    pub(crate) fn subscribe(&mut self, state: &mut State, channel: Bytes) {
+    pub(crate) fn subscribe(&mut self, registry: &mut Registry, channel: Bytes) {
         if self.channels.insert(channel.clone()) {
-            state
-                .subscribers
+            registry
                 .entry(channel)
                 .or_default()
                 .insert(self.id, self.outbox.clone());
@@ -123,27 +125,27 @@ impl Subscriptions {
 
     /// Unsubscribes from `channel`, removing the registry entry once it has no
     /// subscribers left. Unsubscribing from a channel never joined is a no-op.
-    pub(crate) fn unsubscribe(&mut self, state: &mut State, channel: &Bytes) {
+    pub(crate) fn unsubscribe(&mut self, registry: &mut Registry, channel: &Bytes) {
         if self.channels.remove(channel) {
-            remove_from_registry(state, self.id, channel);
+            remove_from_registry(registry, self.id, channel);
         }
     }
 
     /// Unsubscribes from every channel and returns them, in no particular order.
-    pub(crate) fn unsubscribe_all(&mut self, state: &mut State) -> Vec<Bytes> {
+    pub(crate) fn unsubscribe_all(&mut self, registry: &mut Registry) -> Vec<Bytes> {
         let channels: Vec<Bytes> = self.channels.drain().collect();
         for channel in &channels {
-            remove_from_registry(state, self.id, channel);
+            remove_from_registry(registry, self.id, channel);
         }
         channels
     }
 }
 
-fn remove_from_registry(state: &mut State, id: u64, channel: &Bytes) {
-    if let Some(subscribers) = state.subscribers.get_mut(channel) {
+fn remove_from_registry(registry: &mut Registry, id: u64, channel: &Bytes) {
+    if let Some(subscribers) = registry.get_mut(channel) {
         subscribers.remove(&id);
         if subscribers.is_empty() {
-            state.subscribers.remove(channel);
+            registry.remove(channel);
         }
     }
 }
