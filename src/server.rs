@@ -499,8 +499,9 @@ mod tests {
             }
             let (kind, channel, payload) = push_parts(&frame).expect("unexpected frame");
             assert_eq!((&kind[..], &channel[..]), (&b"message"[..], &b"c"[..]));
-            let Frame::Bulk(payload) = payload else {
-                panic!("message without a payload")
+            let payload = match payload {
+                Frame::Bulk(payload) => payload,
+                _ => panic!("message without a payload"),
             };
             let text = String::from_utf8_lossy(&payload);
             let mut fields = text.split(':');
@@ -570,8 +571,9 @@ mod tests {
                     break;
                 }
                 assert_eq!(&kind[..], b"message");
-                let Frame::Bulk(payload) = payload else {
-                    panic!("message without a payload")
+                let payload = match payload {
+                    Frame::Bulk(payload) => payload,
+                    _ => panic!("message without a payload"),
                 };
                 let seq: u64 = String::from_utf8_lossy(&payload).parse().unwrap();
                 assert!(
