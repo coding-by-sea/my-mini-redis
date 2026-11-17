@@ -9,7 +9,8 @@
 
 This project implements a **Redis server speaking the RESP2 wire protocol** from scratch in Rust, wire-compatible with Redis for the commands it supports (`GET`, `SET` without options, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`):
 
-- **Ordered pub/sub delivery**: one queue per connection, filled under the db lock, so messages from every channel arrive in publish order
+- **Ordered pub/sub delivery**: one outbox per connection, filled under the db lock, so messages from every channel arrive in publish order
+- **Batched pub/sub writes**: like Redis, a publisher wakes each subscriber once per batch of pipelined requests, and the subscriber sends everything queued with one write
 - **Slow subscribers never block publishers**: messages queue up to Redis's 32 MB pub/sub limit, then the subscriber is disconnected
 - **Redis-compatible request parsing**: RESP arrays and inline commands, with Redis's exact error replies
 - **Binary-safe keys, values and channel names** using `Bytes` zero-copy buffers
@@ -41,8 +42,8 @@ Key Technics:
 │  │                                                           │  │
 │  │   tokio::select! {                                        │  │
 │  │     connection.read_request()   ─▶ Session::execute()     │  │
-│  │     subscriptions.next_message() ─▶ write "message" push  │  │
-│  │     overflow.wait()              ─▶ disconnect (>32 MB)   │  │
+│  │     subscriptions.ready()       ─▶ write queued messages  │  │
+│  │                                    or disconnect (>32 MB) │  │
 │  │   }                                                       │  │
 │  └───────────────────────────────────┬───────────────────────┘  │
 │                                      │ lock                     │
@@ -52,21 +53,25 @@ Key Technics:
 │  │   subscribers: HashMap<channel, HashMap<conn id, Mailbox>> │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
-        PUBLISH appends (channel, payload) to each subscriber's
-        Mailbox: an unbounded per-connection queue with a byte limit
+        PUBLISH encodes the message once and appends it to each
+        subscriber's Mailbox: a per-connection outbox of encoded
+        bytes with a byte limit. Subscribers are woken after the
+        publisher's batch of requests, not per message.
 ```
 
 ### Key Architectural Decisions
 
-1. **One queue per connection**: `PUBLISH` appends to every subscriber's queue while holding the db lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
+1. **One outbox per connection**: `PUBLISH` appends to every subscriber's outbox while holding the db lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
 
 2. **Replies and messages stay in order**: before running a command, the connection takes the messages already queued (under the same lock) and sends them first. A message published before an `UNSUBSCRIBE` arrives before its acknowledgment, exactly as in Redis.
 
-3. **Bounded memory without backpressure**: queues never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
+3. **Few, large writes**: a publisher wakes each subscriber it queued messages for once, after running its whole batch of pipelined requests and outside the db lock, as Redis writes pending clients once per event loop pass. The subscriber then sends its outbox with one write. Waking per message instead let subscribers on other threads send about 3 messages per write, which made write syscalls the bottleneck (see [the pub/sub deep dive](docs/benchmarks/2026-11-16-pubsub-deep-dive.md)). Reads also grow from 4 KiB up to 64 KiB while they keep filling the buffer, so a pipelined batch runs in few steps.
 
-4. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+4. **Bounded memory without backpressure**: outboxes never block publishers. A subscriber with more than 32 MB queued (Redis's `client-output-buffer-limit pubsub` hard limit) is disconnected.
 
-5. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
+5. **Errors are typed by who caused them**: a bad command gets an error reply and the connection stays open; malformed RESP gets `ERR Protocol error` and the connection closes; I/O failures close the connection and are logged.
+
+6. **Cleanup by RAII**: a connection's `Session` removes its subscriptions when dropped, so channels without subscribers never stay in the registry, even if the connection fails.
 
 ---
 
@@ -76,18 +81,21 @@ Key Technics:
 
 ```rust
 // src/subscription.rs
-pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes) -> usize {
+pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes, wakes: &mut Wakes) -> usize {
     let Some(subscribers) = state.subscribers.get(channel) else {
         return 0;
     };
+    let message = encode_message(channel, payload);
     for mailbox in subscribers.values() {
-        mailbox.deliver(channel, payload);
+        if mailbox.deliver(&message) {
+            wakes.0.push(mailbox.clone());
+        }
     }
     subscribers.len()
 }
 ```
 
-`deliver` pushes onto an unbounded `mpsc` queue, so it never waits. `Bytes` clones are reference-count increments, so a payload is never copied per subscriber.
+The message is encoded once per `PUBLISH`. `deliver` appends it to the subscriber's outbox, so it never waits, and asks for a wakeup only when the outbox was empty. The copy per subscriber is the one that writing needs anyway (before, a shared `Bytes` was copied into each connection's write buffer), and it avoids every subscriber's thread updating one shared reference count. The publisher's connection calls `wakes.wake_all()` after its batch.
 
 ### 2. **Cancel-safe `select!`**
 
@@ -95,12 +103,11 @@ pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes) -> usize 
 // src/server.rs
 tokio::select! {
     request = connection.read_request() => { /* execute, write replies */ }
-    message = session.subscriptions.next_message() => { /* write message */ }
-    () = overflow.wait() => { /* disconnect */ }
+    () = session.subscriptions.ready() => { /* write the outbox, or disconnect if it overflowed */ }
 }
 ```
 
-Every branch is cancel safe: `read_request` only awaits `read_buf`, `mpsc::recv` loses nothing when dropped, and `Notify` keeps a signal sent while nobody waits.
+Every branch is cancel safe: `read_request` only awaits `read_buf`, and `ready` waits on a `Notify`, which keeps a signal sent while nobody waits. Messages stay in the outbox until taken, and every command the connection runs also takes them, so a lost wakeup can't strand them.
 
 ### 3. **Redis-compatible errors**
 
@@ -270,7 +277,7 @@ my-mini-redis/
 │   ├── connection.rs          # TCP stream wrapper (RESP framing)
 │   ├── frame.rs               # RESP frames (replies, parsed by the client)
 │   ├── request.rs             # Request parsing (RESP arrays and inline commands)
-│   ├── subscription.rs        # Per-connection message queues and channel registry
+│   ├── subscription.rs        # Per-connection outboxes, batched wakeups, channel registry
 │   └── lib.rs                 # Public library interface
 ├── tests/
 │   ├── cli_integration.rs     # End-to-end integration tests

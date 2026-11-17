@@ -16,7 +16,7 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 #[derive(Default)]
 struct State {
     entries: HashMap<Bytes, Bytes>,
-    /// Channel -> (connection id -> that connection's queue). A channel is only present
+    /// Channel -> (connection id -> that connection's outbox). A channel is only present
     /// while it has subscribers.
     subscribers: HashMap<Bytes, HashMap<u64, subscription::Mailbox>>,
 }

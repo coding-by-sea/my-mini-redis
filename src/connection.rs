@@ -7,9 +7,19 @@ use std::io::{Cursor, Error, ErrorKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 
+/// Space for the first read of a request batch.
+const READ_SIZE: usize = 4096;
+/// How large reads grow while each one fills the space it was given. A pipelined batch
+/// is then run, and its replies and published messages sent, in a few large steps
+/// instead of one per 4 KiB, as Redis reads up to 16 KiB at a time.
+const MAX_READ_SIZE: usize = 64 * 1024;
+
 pub struct Connection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
+    /// Space reserved for the next request read, between `READ_SIZE` and
+    /// `MAX_READ_SIZE`.
+    read_size: usize,
 }
 
 pub(crate) enum ReadRequestError {
@@ -25,7 +35,8 @@ impl Connection {
             // Large enough to hold the replies to a typical pipelined batch, so they
             // go out in one write.
             stream: BufWriter::with_capacity(64 * 1024, stream),
-            buffer: BytesMut::with_capacity(4096),
+            buffer: BytesMut::with_capacity(READ_SIZE),
+            read_size: READ_SIZE,
         }
     }
 
@@ -57,6 +68,9 @@ impl Connection {
             {
                 return Ok(Some(args));
             }
+            // Parsed arguments are copied out, so this reuses the consumed space.
+            self.buffer.reserve(self.read_size);
+            let space = self.buffer.capacity() - self.buffer.len();
             let read = self
                 .stream
                 .read_buf(&mut self.buffer)
@@ -66,6 +80,11 @@ impl Connection {
                 // A request cut off by the client closing has nobody left to answer.
                 return Ok(None);
             }
+            self.read_size = if read == space {
+                (self.read_size * 2).min(MAX_READ_SIZE)
+            } else {
+                READ_SIZE
+            };
         }
     }
 
