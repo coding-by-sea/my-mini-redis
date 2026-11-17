@@ -493,9 +493,7 @@ mod tests {
                 sleep(Duration::from_millis(2)).await;
             }
             let frame = next_frame(&mut subscriber).await;
-            if let Frame::Array(parts) = &frame
-                && parts.len() == 2
-            {
+            if matches!(&frame, Frame::Array(parts) if parts.len() == 2) {
                 pongs += 1;
                 continue;
             }
