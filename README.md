@@ -1,6 +1,6 @@
 # my-mini-redis
 
-**A high-performance Redis clone demonstrating advanced Rust systems programming, async I/O multiplexing, and lock-free concurrent architectures.**
+**A high-performance Redis clone demonstrating Rust systems programming, async I/O multiplexing, and Redis-style batched pub/sub delivery.**
 
 
 ---
@@ -13,12 +13,12 @@ This project implements a **Redis server speaking the RESP2 wire protocol** from
 - **Batched pub/sub writes**: like Redis, a publisher wakes each subscriber once per batch of pipelined requests, and the subscriber sends everything queued with one write
 - **Slow subscribers never block publishers**: messages queue up to Redis's 32 MB pub/sub limit, then the subscriber is disconnected
 - **Redis-compatible request parsing**: RESP arrays and inline commands, with Redis's exact error replies
-- **Binary-safe keys, values and channel names** using `Bytes` zero-copy buffers
+- **Binary-safe keys, values and channel names** stored as reference-counted `Bytes`
 - **Async connection handling** with `tokio::select!` across commands and pub/sub messages
 
 Key Technics:
 - Async runtime internals (Tokio)
-- Zero-copy buffer management (`Bytes`, `BytesMut`)
+- Buffer management with `Bytes` and `BytesMut` (shared values, reused I/O buffers)
 - Connection-oriented state machines
 - Network protocol design and wire-format parsing
 
@@ -30,13 +30,13 @@ Key Technics:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Client Layer                             │
-│   Publisher / Subscriber / Key-Value clients, redis-cli, ...     │
+│                         Client Layer                            │
+│   Publisher / Subscriber / Key-Value clients, redis-cli, ...    │
 └────────────────────────────────┬────────────────────────────────┘
                                  │ RESP2 or inline commands (TCP)
                                  ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                       Server Layer (Tokio)                       │
+│                       Server Layer (Tokio)                      │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │           Connection Handler (per-connection task)        │  │
 │  │                                                           │  │
@@ -48,9 +48,9 @@ Key Technics:
 │  └───────────────────────────────────┬───────────────────────┘  │
 │                                      │ lock                     │
 │  ┌───────────────────────────────────▼───────────────────────┐  │
-│  │              Shared State (Arc<Mutex<State>>)              │  │
-│  │   entries:     HashMap<Bytes, Bytes>                       │  │
-│  │   subscribers: HashMap<channel, HashMap<conn id, Mailbox>> │  │
+│  │              Shared State (Arc<Mutex<State>>)             │  │
+│  │   entries:     HashMap<Bytes, Bytes>                      │  │
+│  │   subscribers: HashMap<channel, HashMap<conn, Mailbox>>   │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
         PUBLISH encodes the message once and appends it to each
@@ -63,7 +63,7 @@ Key Technics:
 
 1. **One outbox per connection**: `PUBLISH` appends to every subscriber's outbox while holding the db lock. Publishes are therefore totally ordered, and each subscriber receives them in that order no matter how many channels it listens on.
 
-2. **Replies and messages stay in order**: before running a command, the connection takes the messages already queued (under the same lock) and sends them first. A message published before an `UNSUBSCRIBE` arrives before its acknowledgment, exactly as in Redis.
+2. **Replies and messages stay in order**: the messages queued when a command runs are sent before its replies. `SUBSCRIBE`, `UNSUBSCRIBE` and `RESET` take them while holding the db lock, so a message published before an `UNSUBSCRIBE` arrives before its acknowledgment, exactly as in Redis.
 
 3. **Few, large writes**: a publisher wakes each subscriber it queued messages for once, after running its whole batch of pipelined requests and outside the db lock, as Redis writes pending clients once per event loop pass. The subscriber then sends its outbox with one write. Waking per message instead let subscribers on other threads send about 3 messages per write, which made write syscalls the bottleneck (see [the pub/sub deep dive](docs/benchmarks/2026-11-16-pubsub-deep-dive.md)). Reads also grow from 4 KiB up to 64 KiB while they keep filling the buffer, so a pipelined batch runs in few steps.
 
@@ -253,7 +253,7 @@ cargo test --test redis_compat
 - **No `unsafe` blocks**: 100% safe Rust (verified with `rg "unsafe"`)
 - **No data races**: All shared state guarded by `Arc<Mutex<T>>`, atomics or Tokio sync primitives
 - **No use-after-free**: Ownership system enforces lifetime validity at compile time
-- **No memory leaks**: RAII ensures automatic cleanup on task panic (Tokio's `JoinHandle` drops clean up resources)
+- **Connection cleanup by RAII**: when a connection's task ends, including by panic, its `Session` is dropped, which removes its subscriptions from the registry
 
 ---
 
