@@ -80,7 +80,9 @@ impl Server {
                     };
                     // Run every request that has already arrived, then send all the
                     // replies with one write instead of one per reply.
+                    let mut commands = 0;
                     loop {
+                        commands += 1;
                         if let Next::Close = session.execute(args) {
                             session.push_replies();
                             session.outbox.finish().await?;
@@ -98,7 +100,7 @@ impl Server {
                     // for a full socket comes last, so a client that is slow to read
                     // its replies doesn't hold up its subscribers.
                     session.outbox.write_now();
-                    session.wakes.write_all();
+                    let wrote_to_others = session.wakes.write_all();
                     session.outbox.flush().await?;
                     // Like Redis's event loop, serve each client one batch at a time.
                     // While a client's next batch is already waiting, the read above
@@ -107,7 +109,13 @@ impl Server {
                     // and no other worker would collect socket events meanwhile:
                     // publishers then waited 100+ ms behind other publishers, and
                     // PUBLISH ran at a quarter of its rate behind pipelined SETs.
-                    tokio::task::yield_now().await;
+                    // A single command that wrote to nobody else is skipped: its
+                    // client almost always waits for the reply, so the next read
+                    // suspends the task anyway, and yielding would only add a
+                    // scheduler round trip (12% more CPU per request, measured).
+                    if commands > 1 || wrote_to_others {
+                        tokio::task::yield_now().await;
+                    }
                 }
                 () = session.outbox.ready() => {
                     if session.outbox.overflowed() {

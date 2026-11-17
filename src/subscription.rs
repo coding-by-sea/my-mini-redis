@@ -30,8 +30,9 @@ pub(crate) struct Wakes(Vec<Outbox>);
 
 impl Wakes {
     /// Writes the first subscribers' outboxes without waiting, and wakes the tasks of
-    /// the rest, and of any whose socket is full.
-    pub(crate) fn write_all(&mut self) {
+    /// the rest, and of any whose socket is full. Returns whether there were any.
+    pub(crate) fn write_all(&mut self) -> bool {
+        let any = !self.0.is_empty();
         for (index, outbox) in self.0.drain(..).enumerate() {
             if index < INLINE_WRITE_LIMIT {
                 outbox.write_now();
@@ -39,6 +40,7 @@ impl Wakes {
                 outbox.wake();
             }
         }
+        any
     }
 }
 
