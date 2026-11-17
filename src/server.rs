@@ -2,9 +2,9 @@ use crate::cmd::Command;
 use crate::connection::{Connection, ReadRequestError};
 use crate::frame::Frame;
 use crate::request::ProtocolError;
-use crate::subscription::{self, Message, QUEUE_LIMIT_BYTES, Subscriptions};
+use crate::subscription::{self, QUEUE_LIMIT_BYTES, Subscriptions, Wakes};
 use crate::{DEFAULT_ADDRESS, Db, lock};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, sleep};
 
@@ -63,7 +63,6 @@ impl Server {
     async fn handle(socket: TcpStream, db: Db) -> anyhow::Result<()> {
         let mut connection = Connection::new(socket);
         let mut session = Session::new(db);
-        let overflow = session.subscriptions.overflow_signal();
 
         loop {
             tokio::select! {
@@ -80,9 +79,8 @@ impl Server {
                     // replies with one write instead of one per reply.
                     loop {
                         let (messages, replies, next) = session.execute(args);
-                        for message in messages {
-                            connection.buffer_encoded(&message).await?;
-                        }
+                        connection.buffer_encoded(&messages).await?;
+                        session.subscriptions.recycle(messages);
                         for reply in replies {
                             connection.buffer_frame(reply).await?;
                         }
@@ -96,21 +94,25 @@ impl Server {
                             Err(error) => return protocol_error(&mut connection, error).await,
                         }
                     }
+                    // Subscribers this batch published to send its messages now, each
+                    // with one write.
+                    session.wakes.wake_all();
                     connection.flush().await?;
                 }
-                message = session.subscriptions.next_message() => {
-                    // Send this message and everything else already queued in one write.
-                    connection.buffer_encoded(&message).await?;
-                    for message in session.subscriptions.take_queued() {
-                        connection.buffer_encoded(&message).await?;
+                () = session.subscriptions.ready() => {
+                    if session.subscriptions.overflowed() {
+                        anyhow::bail!(
+                            "closed subscriber: over {} MB of messages queued",
+                            QUEUE_LIMIT_BYTES / (1024 * 1024)
+                        );
                     }
-                    connection.flush().await?;
-                }
-                () = overflow.wait() => {
-                    anyhow::bail!(
-                        "closed subscriber: over {} MB of messages queued",
-                        QUEUE_LIMIT_BYTES / (1024 * 1024)
-                    );
+                    // Send everything queued in one write.
+                    let messages = session.subscriptions.take_queued();
+                    if !messages.is_empty() {
+                        connection.buffer_encoded(&messages).await?;
+                        connection.flush().await?;
+                    }
+                    session.subscriptions.recycle(messages);
                 }
             }
         }
@@ -127,6 +129,9 @@ enum Next {
 struct Session {
     db: Db,
     subscriptions: Subscriptions,
+    /// Subscribers this connection's PUBLISHes queued messages for, woken after each
+    /// batch of requests.
+    wakes: Wakes,
 }
 
 impl Session {
@@ -134,10 +139,11 @@ impl Session {
         Self {
             db,
             subscriptions: Subscriptions::new(),
+            wakes: Wakes::default(),
         }
     }
 
-    /// Runs one request. Returns the messages already queued for this connection,
+    /// Runs one request. Returns the encoded messages already queued for this connection,
     /// which go out before the replies as in Redis, then the replies.
     ///
     /// The db lock is only held for the step of a command that reads or changes
@@ -147,7 +153,7 @@ impl Session {
     /// queued when the command runs: a PUBLISH that finished earlier has already
     /// queued its message, and one running concurrently may land on either side, as
     /// in Redis.
-    fn execute(&mut self, args: Vec<Bytes>) -> (Vec<Message>, Vec<Frame>, Next) {
+    fn execute(&mut self, args: Vec<Bytes>) -> (BytesMut, Vec<Frame>, Next) {
         let command = match Command::from_args(args) {
             Ok(command) => command,
             Err(message) => return self.reply(vec![error_frame(message)], Next::Continue),
@@ -172,8 +178,12 @@ impl Session {
                 self.reply(vec![Frame::Simple("OK".into())], Next::Continue)
             }
             Command::Publish(cmd) => {
-                let receivers =
-                    subscription::publish(&lock(&self.db), cmd.channel(), cmd.message());
+                let receivers = subscription::publish(
+                    &lock(&self.db),
+                    cmd.channel(),
+                    cmd.message(),
+                    &mut self.wakes,
+                );
                 self.reply(vec![Frame::Integer(receivers as i64)], Next::Continue)
             }
             Command::Subscribe(cmd) => {
@@ -239,7 +249,7 @@ impl Session {
 
     /// Pairs `replies` with the messages queued so far, taken without the db lock,
     /// for commands that don't change subscriptions (see `execute`).
-    fn reply(&mut self, replies: Vec<Frame>, next: Next) -> (Vec<Message>, Vec<Frame>, Next) {
+    fn reply(&mut self, replies: Vec<Frame>, next: Next) -> (BytesMut, Vec<Frame>, Next) {
         (self.subscriptions.take_queued(), replies, next)
     }
 }
