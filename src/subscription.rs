@@ -133,13 +133,11 @@ impl Subscriptions {
         }
     }
 
-    /// Unsubscribes from every channel and returns them, in no particular order.
-    pub(crate) fn unsubscribe_all(&mut self, registry: &mut Registry) -> Vec<Bytes> {
-        let channels: Vec<Bytes> = self.channels.drain().collect();
-        for channel in &channels {
-            remove_from_registry(registry, self.id, channel);
+    /// Unsubscribes from every channel.
+    pub(crate) fn unsubscribe_all(&mut self, registry: &mut Registry) {
+        for channel in self.channels.drain() {
+            remove_from_registry(registry, self.id, &channel);
         }
-        channels
     }
 }
 

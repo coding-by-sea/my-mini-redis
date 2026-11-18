@@ -23,7 +23,10 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        f.write_str(match self {
+            Error::IncompleteFrame => "incomplete RESP frame",
+            Error::InvalidEncoding => "invalid RESP encoding",
+        })
     }
 }
 impl std::error::Error for Error {}

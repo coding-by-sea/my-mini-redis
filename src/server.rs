@@ -29,9 +29,11 @@ impl Server {
         Self { db: Db::default() }
     }
 
-    pub async fn run(&mut self) {
-        let listener = TcpListener::bind(DEFAULT_ADDRESS).await.unwrap();
+    /// Serves on `DEFAULT_ADDRESS` forever. Fails only if it can't bind.
+    pub async fn run(&mut self) -> std::io::Result<()> {
+        let listener = TcpListener::bind(DEFAULT_ADDRESS).await?;
         self.run_with_listener(listener).await;
+        Ok(())
     }
 
     pub async fn run_with_listener(&mut self, listener: TcpListener) {
@@ -564,7 +566,6 @@ mod tests {
             );
             // Let some messages through, then unsubscribe while they keep coming.
             let mut last = None;
-            let mut seen = 0;
             subscriber
                 .write_frame(Unsubscribe::new(vec!["c".into()]).into_frame())
                 .await
@@ -586,9 +587,7 @@ mod tests {
                     "messages out of order"
                 );
                 last = Some(seq);
-                seen += 1;
             }
-            let _ = seen;
             // Nothing for "c" may follow the unsubscribe acknowledgment: the next
             // frame must be the reply to this PING.
             subscriber
