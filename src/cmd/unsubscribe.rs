@@ -1,3 +1,4 @@
+use super::to_bytes;
 use crate::frame::Frame;
 use bytes::Bytes;
 
@@ -6,10 +7,17 @@ pub struct Unsubscribe {
 }
 
 impl Unsubscribe {
-    /// An empty list unsubscribes from every channel.
-    pub fn new(channels: Vec<String>) -> Self {
+    /// Unsubscribes from `channels`; an empty list unsubscribes from every channel.
+    pub fn new(channels: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Self {
         Self {
-            channels: channels.into_iter().map(Bytes::from).collect(),
+            channels: channels.into_iter().map(to_bytes).collect(),
+        }
+    }
+
+    /// Unsubscribes from every channel.
+    pub fn all() -> Self {
+        Self {
+            channels: Vec::new(),
         }
     }
 

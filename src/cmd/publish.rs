@@ -1,3 +1,4 @@
+use super::to_bytes;
 use crate::frame::Frame;
 use bytes::Bytes;
 
@@ -7,9 +8,9 @@ pub struct Publish {
 }
 
 impl Publish {
-    pub fn new(channel: impl ToString, message: Bytes) -> Self {
+    pub fn new(channel: impl AsRef<[u8]>, message: Bytes) -> Self {
         Self {
-            channel: Bytes::from(channel.to_string()),
+            channel: to_bytes(channel),
             message,
         }
     }

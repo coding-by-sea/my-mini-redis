@@ -200,7 +200,9 @@ impl Session {
                 self.reply(value.map_or(Frame::Null, Frame::Bulk), Next::Continue)
             }
             Command::Set(cmd) => {
-                self.db.entries.insert(cmd.key().clone(), cmd.value());
+                self.db
+                    .entries
+                    .insert(cmd.key().clone(), cmd.value().clone());
                 self.reply(Frame::Simple("OK".into()), Next::Continue)
             }
             Command::Publish(cmd) => {
@@ -396,19 +398,11 @@ mod tests {
         assert_eq!(channel_count(&db), 1);
 
         // One subscriber left: the channel stays.
-        request(
-            &mut first,
-            Unsubscribe::new(vec!["news".into()]).into_frame(),
-        )
-        .await;
+        request(&mut first, Unsubscribe::new(["news"]).into_frame()).await;
         assert_eq!(channel_count(&db), 1);
 
         // Last subscriber left: the channel is removed (cleanup may finish just after the reply).
-        request(
-            &mut second,
-            Unsubscribe::new(vec!["news".into()]).into_frame(),
-        )
-        .await;
+        request(&mut second, Unsubscribe::new(["news"]).into_frame()).await;
         wait_for_channel_count(&db, 0).await;
     }
 
@@ -567,7 +561,7 @@ mod tests {
             // Let some messages through, then unsubscribe while they keep coming.
             let mut last = None;
             subscriber
-                .write_frame(Unsubscribe::new(vec!["c".into()]).into_frame())
+                .write_frame(Unsubscribe::new(["c"]).into_frame())
                 .await
                 .unwrap();
             loop {

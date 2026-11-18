@@ -78,8 +78,7 @@ impl Client {
         if channels.is_empty() {
             return self.unsubscribe_all().await;
         }
-        let unsubscribe_frame =
-            Unsubscribe::new(channels.iter().map(|s| s.to_string()).collect()).into_frame();
+        let unsubscribe_frame = Unsubscribe::new(channels).into_frame();
         self.connection.write_frame(unsubscribe_frame).await?;
 
         // One acknowledgment per channel, in request order.
@@ -90,7 +89,7 @@ impl Client {
     }
 
     pub async fn unsubscribe_all(&mut self) -> anyhow::Result<()> {
-        let unsubscribe_frame = Unsubscribe::new(vec![]).into_frame();
+        let unsubscribe_frame = Unsubscribe::all().into_frame();
         self.connection.write_frame(unsubscribe_frame).await?;
 
         // One acknowledgment per subscribed channel, or a single one with a nil channel
