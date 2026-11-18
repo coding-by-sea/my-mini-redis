@@ -23,6 +23,7 @@
 //!   this, a subscriber fed by several publishers could keep one writer in a loop that
 //!   never awaits, stalling its worker thread and the tasks queued on it for 100+ ms.
 
+use crate::lock;
 use bytes::{Buf, BytesMut};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -216,11 +217,7 @@ impl Outbox {
     /// sent (releasing the token if nothing more is queued), the socket is full, or
     /// more was queued meanwhile. The caller holds the token.
     fn write_some(&self) -> io::Result<Progress> {
-        let mut sending = self
-            .0
-            .sending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sending = lock(&self.0.sending);
         let mut took = false;
         loop {
             if sending.is_empty() {
@@ -255,9 +252,6 @@ impl Outbox {
     /// The lock is never held across anything that can panic, so poisoning is ignored
     /// as for the db locks.
     fn queue(&self) -> MutexGuard<'_, Queue> {
-        self.0
-            .queue
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        lock(&self.0.queue)
     }
 }

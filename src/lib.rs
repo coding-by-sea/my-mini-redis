@@ -3,15 +3,15 @@ use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-pub mod connection;
-pub mod frame;
-mod outbox;
-
 pub mod client;
 pub mod cmd;
-mod request;
+pub mod connection;
+pub mod frame;
 pub mod server;
 pub mod subscription;
+
+mod outbox;
+mod request;
 
 pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 
@@ -19,7 +19,7 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 /// locks, so a PUBLISH fanning out to many subscribers doesn't hold up SET and GET,
 /// and the other way around.
 #[derive(Default)]
-struct Shared {
+struct ServerState {
     /// Sharded, each shard with its own read-write lock: with one lock for all keys,
     /// pipelined SETs from 50 connections spent about 60% of the server's CPU waking
     /// each other up on unlock (`futex_wake`), and under 1% inserting.
@@ -28,7 +28,7 @@ struct Shared {
     /// sees them in the same order, as in Redis.
     registry: Mutex<Registry>,
 }
-type Db = Arc<Shared>;
+type Db = Arc<ServerState>;
 
 /// Channel -> (connection id -> that connection's outbox). A channel is only present
 /// while it has subscribers.
