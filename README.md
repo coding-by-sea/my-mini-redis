@@ -239,7 +239,7 @@ scripts/bench.sh --quick        # summary and memory only
 scripts/bench.sh --help         # all options
 ```
 
-[`benches/load.rs`](benches/load.rs) starts my-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
+[`benches/load/`](benches/load/) starts my-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
 
 - **Summary:** PING, SET, GET and PUBLISH (raw and pipelined), SET and GET through the `Client` library, pub/sub fan-out, and pipelined SET running alongside pub/sub. Each scenario has its throughput relative to Redis, p50/p90/p99/p99.9/max latency, server CPU per operation, cores used and peak memory.
 - **Memory:** idle footprint, memory per connection, and memory per key.
