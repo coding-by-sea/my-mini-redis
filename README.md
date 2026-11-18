@@ -64,7 +64,7 @@ Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchma
 │  │           Connection Handler (per-connection task)        │  │
 │  │                                                           │  │
 │  │   tokio::select! {                                        │  │
-│  │     reader.read_request()  ─▶ Session::execute()          │  │
+│  │     reader.read_request()  ─▶ Session::serve_batch()      │  │
 │  │     outbox.ready()         ─▶ finish a write the socket   │  │
 │  │                               blocked, or disconnect      │  │
 │  │                               (>32 MB queued)             │  │
@@ -112,8 +112,13 @@ Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchma
 
 ```rust
 // src/subscription.rs
-pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes, wakes: &mut Wakes) -> usize {
-    let Some(subscribers) = state.subscribers.get(channel) else {
+pub(crate) fn publish(
+    registry: &Registry,
+    channel: &Bytes,
+    payload: &Bytes,
+    wakes: &mut Wakes,
+) -> usize {
+    let Some(subscribers) = registry.get(channel) else {
         return 0;
     };
     let message = encode_message(channel, payload);
@@ -138,7 +143,7 @@ tokio::select! {
 }
 ```
 
-Every branch is cancel safe: `read_request` only awaits socket readiness, and `ready` waits on a `Notify`, which keeps a signal sent while nobody waits. Queued bytes can't be stranded: the writer token is only released with the outbox empty, checked under its lock.
+Every branch is cancel safe: `read_request` only awaits `read_buf`, and `ready` waits on a `Notify`, which keeps a signal sent while nobody waits. Queued bytes can't be stranded: the writer token is only released with the outbox empty, checked under its lock.
 
 ### 3. **Redis-compatible errors**
 
@@ -205,7 +210,7 @@ export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
 
 ```bash
 brew install redis              # or: apt install redis-server (needed for the comparison)
-scripts/bench.sh                # full run, about 4 minutes
+scripts/bench.sh                # full run, about 5 minutes
 scripts/bench.sh --quick        # summary and memory only
 scripts/bench.sh --help         # all options
 ```
@@ -246,7 +251,7 @@ my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE
 
 ### Redis wire compatibility
 
-[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 34 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining (including Nagle stalls), slow subscribers and running out of file descriptors. 5 more tests in `src/server.rs` cover pub/sub channel cleanup and, under concurrent writers, whole frames and the order of messages and acknowledgments. All of them pass.
+[`tests/redis_compat.rs`](tests/redis_compat.rs) pins down Redis's behavior with 35 raw-RESP tests: error replies, pub/sub semantics, binary safety, protocol errors, inline commands, pipelining (including Nagle stalls), slow subscribers and running out of file descriptors. 5 more tests in `src/server.rs` cover pub/sub channel cleanup and, under concurrent writers, whole frames and the order of messages and acknowledgments. All of them pass.
 
 The test expectations are themselves checked against a real Redis: CI's `redis-compat` job runs them against Redis 7.2.5 on every pull request, and all pass there (the file-descriptor test skips itself in that mode). To run that check locally:
 
@@ -295,9 +300,9 @@ cargo test --test redis_compat
 
 ### Test Coverage
 
-- **23 Unit Tests**: RESP frame encoding/decoding, request parsing (RESP and inline), 3 pub/sub channel-cleanup tests, and 2 stress tests of pub/sub delivery with several writers per socket
-- **15 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, and CLI subscribe mode driven through stdin
-- **34 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, run against Redis 7.2.5 in CI
+- **32 Unit Tests**: RESP frame encoding and decoding, request parsing (RESP and inline, including requests split across reads), the client connection and its pub/sub push parsing, 3 pub/sub channel-cleanup tests, and 2 stress tests of pub/sub delivery with several writers per socket
+- **21 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, the client library's error paths, and CLI subscribe mode driven through stdin
+- **35 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, run against Redis 7.2.5 in CI
 - **4 CLI Parsing Tests**: Clap argument validation
 
 
@@ -328,7 +333,7 @@ my-mini-redis/
 │   ├── client.rs              # Client library API
 │   ├── server.rs              # Server connection handler
 │   ├── connection.rs          # Client connection (RESP framing) and the server's request reader
-│   ├── frame.rs               # RESP frames (encoded by the server, parsed by the client)
+│   ├── frame.rs               # RESP frames (encoded by both sides, parsed by the client)
 │   ├── outbox.rs              # Per-connection output FIFO and single-writer token
 │   ├── request.rs             # Request parsing (RESP arrays and inline commands)
 │   ├── subscription.rs        # Channel registry, fan-out and batched subscriber writes
