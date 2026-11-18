@@ -244,7 +244,11 @@ redis-cli -p 47392 shutdown nosave
 5. **Protocol and security** — RESP3, `AUTH`/ACL, `INFO`, `CONFIG`
 6. **Advanced** — replication, Lua scripting, streams
 
-Design notes and earlier plans are in [`docs/`](docs/).
+The design is documented where it is implemented: see the module docs of
+[`src/outbox.rs`](src/outbox.rs) (per-connection output and the single-writer rule) and
+[`src/subscription.rs`](src/subscription.rs) (pub/sub fan-out). Benchmark reports,
+including the measurements behind those designs, are in
+[`docs/benchmarks/`](docs/benchmarks/).
 
 ---
 
@@ -309,7 +313,7 @@ my-mini-redis/
 ├── tests/
 │   ├── cli_integration.rs     # End-to-end integration tests
 │   └── redis_compat.rs        # Redis wire-compatibility tests (raw RESP)
-├── docs/                      # Design notes and implementation plans
+├── docs/benchmarks/           # Benchmark reports (Markdown and JSON)
 ├── examples/
 │   └── hello-redis.rs         # Example usage
 ├── Cargo.toml                 # Dependency manifest
