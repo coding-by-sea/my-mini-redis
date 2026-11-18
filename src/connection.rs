@@ -6,6 +6,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use std::io::{Cursor, Error, ErrorKind};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
+use tokio::net::tcp::OwnedReadHalf;
 
 /// Space for the first read of a request batch.
 const READ_SIZE: usize = 4096;
@@ -17,8 +18,16 @@ const MAX_READ_SIZE: usize = 64 * 1024;
 pub struct Connection {
     stream: BufWriter<TcpStream>,
     buffer: BytesMut,
-    /// Space reserved for the next request read, between `READ_SIZE` and
-    /// `MAX_READ_SIZE`.
+}
+
+/// The server's reading side of a connection; the connection's outbox has the
+/// writing side.
+pub(crate) struct RequestReader {
+    // Read through `AsyncRead`, which assumes the socket is drained after a short read,
+    // instead of `readable` and `try_read`, which cost a second `recvfrom` per request.
+    socket: OwnedReadHalf,
+    buffer: BytesMut,
+    /// Space reserved for the next read, between `READ_SIZE` and `MAX_READ_SIZE`.
     read_size: usize,
 }
 
@@ -32,11 +41,10 @@ pub(crate) enum ReadRequestError {
 impl Connection {
     pub fn new(stream: TcpStream) -> Connection {
         Connection {
-            // Large enough to hold the replies to a typical pipelined batch, so they
-            // go out in one write.
+            // Large enough to hold a typical pipelined batch, so it goes out in one
+            // write.
             stream: BufWriter::with_capacity(64 * 1024, stream),
-            buffer: BytesMut::with_capacity(READ_SIZE),
-            read_size: READ_SIZE,
+            buffer: BytesMut::with_capacity(4096),
         }
     }
 
@@ -52,55 +60,6 @@ impl Connection {
                 } else {
                     Err(Error::from(ErrorKind::ConnectionReset).into())
                 };
-            }
-        }
-    }
-
-    /// Reads the next client request (server side). Returns `Ok(None)` once the client
-    /// closes the connection. Requests Redis ignores, such as empty arrays, are skipped.
-    ///
-    /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
-    pub(crate) async fn read_request(&mut self) -> Result<Option<Vec<Bytes>>, ReadRequestError> {
-        loop {
-            if let Some(args) = self
-                .buffered_request()
-                .map_err(ReadRequestError::Protocol)?
-            {
-                return Ok(Some(args));
-            }
-            // Parsed arguments are copied out, so this reuses the consumed space.
-            self.buffer.reserve(self.read_size);
-            let space = self.buffer.capacity() - self.buffer.len();
-            let read = self
-                .stream
-                .read_buf(&mut self.buffer)
-                .await
-                .map_err(|error| ReadRequestError::Io(error.into()))?;
-            if read == 0 {
-                // A request cut off by the client closing has nobody left to answer.
-                return Ok(None);
-            }
-            self.read_size = if read == space {
-                (self.read_size * 2).min(MAX_READ_SIZE)
-            } else {
-                READ_SIZE
-            };
-        }
-    }
-
-    /// Returns the next request that has already been received in full, without
-    /// reading from the socket. Requests Redis ignores, such as empty arrays, are
-    /// skipped.
-    pub(crate) fn buffered_request(&mut self) -> Result<Option<Vec<Bytes>>, ProtocolError> {
-        loop {
-            match request::parse(&self.buffer)? {
-                Parsed::Request { args, consumed } => {
-                    self.buffer.advance(consumed);
-                    if !args.is_empty() {
-                        return Ok(Some(args));
-                    }
-                }
-                Parsed::Incomplete => return Ok(None),
             }
         }
     }
@@ -128,24 +87,6 @@ impl Connection {
         } else {
             Ok(())
         }
-    }
-
-    /// Adds a frame to the write buffer without sending it; call `flush` to send.
-    /// The buffer is also written out whenever it fills up.
-    pub(crate) async fn buffer_frame(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
-        self.write_value(frame).await
-    }
-
-    /// Adds already encoded RESP bytes to the write buffer without sending them.
-    pub(crate) async fn buffer_encoded(&mut self, bytes: &[u8]) -> Result<(), anyhow::Error> {
-        self.stream.write_all(bytes).await?;
-        Ok(())
-    }
-
-    /// Sends everything buffered.
-    pub(crate) async fn flush(&mut self) -> Result<(), anyhow::Error> {
-        self.stream.flush().await?;
-        Ok(())
     }
 
     async fn write_value(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
@@ -200,6 +141,66 @@ impl Connection {
         self.stream.write_all(b"\r\n").await?;
 
         Ok(())
+    }
+}
+
+impl RequestReader {
+    pub(crate) fn new(socket: OwnedReadHalf) -> Self {
+        Self {
+            socket,
+            buffer: BytesMut::with_capacity(READ_SIZE),
+            read_size: READ_SIZE,
+        }
+    }
+
+    /// Reads the next client request. Returns `Ok(None)` once the client closes the
+    /// connection. Requests Redis ignores, such as empty arrays, are skipped.
+    ///
+    /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
+    pub(crate) async fn read_request(&mut self) -> Result<Option<Vec<Bytes>>, ReadRequestError> {
+        let io_error = |error: std::io::Error| ReadRequestError::Io(error.into());
+        loop {
+            if let Some(args) = self
+                .buffered_request()
+                .map_err(ReadRequestError::Protocol)?
+            {
+                return Ok(Some(args));
+            }
+            // Parsed arguments are copied out, so this reuses the consumed space.
+            self.buffer.reserve(self.read_size);
+            let space = self.buffer.capacity() - self.buffer.len();
+            let read = self
+                .socket
+                .read_buf(&mut self.buffer)
+                .await
+                .map_err(io_error)?;
+            if read == 0 {
+                // A request cut off by the client closing has nobody left to answer.
+                return Ok(None);
+            }
+            self.read_size = if read == space {
+                (self.read_size * 2).min(MAX_READ_SIZE)
+            } else {
+                READ_SIZE
+            };
+        }
+    }
+
+    /// Returns the next request that has already been received in full, without
+    /// reading from the socket. Requests Redis ignores, such as empty arrays, are
+    /// skipped.
+    pub(crate) fn buffered_request(&mut self) -> Result<Option<Vec<Bytes>>, ProtocolError> {
+        loop {
+            match request::parse(&self.buffer)? {
+                Parsed::Request { args, consumed } => {
+                    self.buffer.advance(consumed);
+                    if !args.is_empty() {
+                        return Ok(Some(args));
+                    }
+                }
+                Parsed::Incomplete => return Ok(None),
+            }
+        }
     }
 }
 

@@ -1,107 +1,67 @@
-//! Pub/sub delivery. Each connection has one outbox of encoded messages that PUBLISH
-//! appends to while holding the db lock, so messages from every channel reach a
-//! subscriber in the order they were published, and a slow subscriber never blocks a
-//! publisher.
+//! Pub/sub delivery. PUBLISH appends each message to the outbox of every subscriber
+//! while holding the db lock, so messages from every channel reach a subscriber in the
+//! order they were published, and a slow subscriber never blocks a publisher.
 //!
-//! Like Redis's "clients pending write", a publisher doesn't wake a subscriber per
-//! message: it notes the subscribers whose outbox it made non-empty and wakes them once
-//! its whole batch of pipelined requests has run (`Wakes`). Each subscriber then sends
-//! everything queued with one write, instead of racing the publisher and sending a
-//! few messages per write.
+//! Like Redis's "clients pending write", a publisher doesn't send per message: it notes
+//! the subscribers whose outbox it made non-empty, and once its whole batch of
+//! pipelined requests has run, writes their outboxes itself (`Wakes`). Each subscriber
+//! then gets the batch with one write, and its task isn't woken unless its socket is
+//! full.
 
 use crate::State;
+use crate::outbox::Outbox;
 use bytes::{BufMut, Bytes, BytesMut};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::sync::Notify;
 
-/// Redis's default `client-output-buffer-limit pubsub` hard limit. A subscriber with
-/// more than this queued (counted in encoded bytes, as Redis counts its output
-/// buffer) is disconnected rather than buffered without bound.
-pub(crate) const QUEUE_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+/// How many subscribers a publisher writes to itself after a batch. The rest are
+/// written by their own tasks, so a channel with thousands of subscribers doesn't hold
+/// up one publisher's next batch for thousands of writes. Measured on Linux with 4
+/// publishers: writing all of 500 subscribers inline gave the best tail latency and
+/// 13% less CPU than waking their tasks, and 512 beat 128 at 2000 subscribers; a cap
+/// of 32 was clearly worse.
+const INLINE_WRITE_LIMIT: usize = 512;
 
-/// A spare outbox buffer larger than this is freed rather than kept for reuse, so one
-/// burst doesn't pin its memory for the life of the connection.
-const SPARE_CAPACITY_LIMIT: usize = 1024 * 1024;
-
-/// The publishing side of a connection's outbox, stored in the channel registry.
-#[derive(Clone)]
-pub(crate) struct Mailbox(Arc<Shared>);
-
-struct Shared {
-    outbox: Mutex<Outbox>,
-    /// Notified when the outbox goes from empty to non-empty, or overflows.
-    ready: Notify,
-}
-
+/// Subscribers a publisher has queued messages for and still has to send them to.
+/// Sending after the publisher's batch, instead of per message, lets each subscriber
+/// get the whole batch with one write, and keeps the writes outside the db lock.
 #[derive(Default)]
-struct Outbox {
-    bytes: BytesMut,
-    overflowed: bool,
-}
-
-impl Mailbox {
-    /// Appends an encoded message. Returns whether the subscriber needs waking: the
-    /// outbox was empty, so no wake is pending yet, or it just overflowed. Over the
-    /// limit, what is queued is dropped and the connection is told to close instead.
-    fn deliver(&self, message: &[u8]) -> bool {
-        let mut outbox = self.outbox();
-        if outbox.overflowed {
-            return false;
-        }
-        if outbox.bytes.len() + message.len() > QUEUE_LIMIT_BYTES {
-            outbox.overflowed = true;
-            outbox.bytes = BytesMut::new();
-            return true;
-        }
-        let was_empty = outbox.bytes.is_empty();
-        outbox.bytes.extend_from_slice(message);
-        was_empty
-    }
-
-    /// The outbox lock is never held across anything that can panic, so poisoning is
-    /// ignored as for the db lock.
-    fn outbox(&self) -> MutexGuard<'_, Outbox> {
-        self.0
-            .outbox
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Subscribers a publisher has queued messages for and still has to wake. Waking them
-/// after the publisher's batch, instead of per message, lets each subscriber send the
-/// whole batch with one write, and keeps the wakeups outside the db lock.
-#[derive(Default)]
-pub(crate) struct Wakes(Vec<Mailbox>);
+pub(crate) struct Wakes(Vec<Outbox>);
 
 impl Wakes {
-    pub(crate) fn wake_all(&mut self) {
-        for mailbox in self.0.drain(..) {
-            mailbox.0.ready.notify_one();
+    /// Writes the first subscribers' outboxes without waiting, and wakes the tasks of
+    /// the rest, and of any whose socket is full. Returns whether there were any.
+    pub(crate) fn write_all(&mut self) -> bool {
+        let any = !self.0.is_empty();
+        for (index, outbox) in self.0.drain(..).enumerate() {
+            if index < INLINE_WRITE_LIMIT {
+                outbox.write_now();
+            } else {
+                outbox.wake();
+            }
         }
+        any
     }
 }
 
 impl Drop for Wakes {
     /// However the publisher's connection ends, its subscribers still get their messages.
     fn drop(&mut self) {
-        self.wake_all();
+        self.write_all();
     }
 }
 
 /// Queues `payload` for every subscriber of `channel` and returns how many there were.
-/// The subscribers to wake are added to `wakes`. Never creates a registry entry for a
-/// channel without subscribers.
+/// The subscribers to send to are added to `wakes`. Never creates a registry entry for
+/// a channel without subscribers.
 pub(crate) fn publish(state: &State, channel: &Bytes, payload: &Bytes, wakes: &mut Wakes) -> usize {
     let Some(subscribers) = state.subscribers.get(channel) else {
         return 0;
     };
     let message = encode_message(channel, payload);
-    for mailbox in subscribers.values() {
-        if mailbox.deliver(&message) {
-            wakes.0.push(mailbox.clone());
+    for outbox in subscribers.values() {
+        if outbox.deliver(&message) {
+            wakes.0.push(outbox.clone());
         }
     }
     subscribers.len()
@@ -119,27 +79,21 @@ fn encode_message(channel: &[u8], payload: &[u8]) -> BytesMut {
     out
 }
 
-/// One connection's subscriptions and the receiving side of its outbox.
+/// One connection's subscriptions.
 pub(crate) struct Subscriptions {
     id: u64,
     channels: HashSet<Bytes>,
-    mailbox: Mailbox,
-    /// An empty buffer swapped in for the outbox's when taking messages, so steady
-    /// state delivery allocates nothing.
-    spare: BytesMut,
+    /// The connection's outbox, registered for every subscribed channel.
+    outbox: Outbox,
 }
 
 impl Subscriptions {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(outbox: Outbox) -> Self {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             channels: HashSet::new(),
-            mailbox: Mailbox(Arc::new(Shared {
-                outbox: Mutex::default(),
-                ready: Notify::new(),
-            })),
-            spare: BytesMut::new(),
+            outbox,
         }
     }
 
@@ -163,7 +117,7 @@ impl Subscriptions {
                 .subscribers
                 .entry(channel)
                 .or_default()
-                .insert(self.id, self.mailbox.clone());
+                .insert(self.id, self.outbox.clone());
         }
     }
 
@@ -182,35 +136,6 @@ impl Subscriptions {
             remove_from_registry(state, self.id, channel);
         }
         channels
-    }
-
-    /// Takes the encoded messages already queued, without waiting. Called while holding
-    /// the db lock, the result is exactly the messages published before this point,
-    /// which matters when the caller also changes subscriptions. Hand the buffer back
-    /// with `recycle` once it is written.
-    pub(crate) fn take_queued(&mut self) -> BytesMut {
-        let spare = std::mem::take(&mut self.spare);
-        std::mem::replace(&mut self.mailbox.outbox().bytes, spare)
-    }
-
-    /// Keeps a buffer from `take_queued` for reuse.
-    pub(crate) fn recycle(&mut self, mut buffer: BytesMut) {
-        if buffer.capacity() <= SPARE_CAPACITY_LIMIT && buffer.capacity() > self.spare.capacity() {
-            buffer.clear();
-            self.spare = buffer;
-        }
-    }
-
-    /// Waits until messages may be queued, or the outbox overflowed. It can return with
-    /// nothing queued. Cancel safe: a wakeup sent while nobody waits is kept for the
-    /// next call.
-    pub(crate) async fn ready(&self) {
-        self.mailbox.0.ready.notified().await;
-    }
-
-    /// Whether the outbox went over its limit; the connection must then close.
-    pub(crate) fn overflowed(&self) -> bool {
-        self.mailbox.outbox().overflowed
     }
 }
 

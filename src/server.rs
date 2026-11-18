@@ -1,10 +1,12 @@
 use crate::cmd::Command;
-use crate::connection::{Connection, ReadRequestError};
+use crate::connection::{ReadRequestError, RequestReader};
 use crate::frame::Frame;
+use crate::outbox::{Outbox, QUEUE_LIMIT_BYTES};
 use crate::request::ProtocolError;
-use crate::subscription::{self, QUEUE_LIMIT_BYTES, Subscriptions, Wakes};
-use crate::{DEFAULT_ADDRESS, Db, lock};
+use crate::subscription::{self, Subscriptions, Wakes};
+use crate::{DEFAULT_ADDRESS, Db, State, lock};
 use bytes::{Bytes, BytesMut};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, sleep};
 
@@ -61,58 +63,62 @@ impl Server {
     /// error reply and the connection stays open; malformed RESP gets a protocol
     /// error and closes the connection; I/O failures close it and are returned.
     async fn handle(socket: TcpStream, db: Db) -> anyhow::Result<()> {
-        let mut connection = Connection::new(socket);
-        let mut session = Session::new(db);
+        let (read, write) = socket.into_split();
+        let mut reader = RequestReader::new(read);
+        let mut session = Session::new(db, Outbox::new(Arc::new(write)));
 
         loop {
             tokio::select! {
-                request = connection.read_request() => {
+                request = reader.read_request() => {
                     let mut args = match request {
                         Ok(Some(args)) => args,
                         Ok(None) => return Ok(()),
                         Err(ReadRequestError::Protocol(error)) => {
-                            return protocol_error(&mut connection, error).await;
+                            return protocol_error(&mut session, error).await;
                         }
                         Err(ReadRequestError::Io(error)) => return Err(error),
                     };
                     // Run every request that has already arrived, then send all the
                     // replies with one write instead of one per reply.
                     loop {
-                        let (messages, replies, next) = session.execute(args);
-                        connection.buffer_encoded(&messages).await?;
-                        session.subscriptions.recycle(messages);
-                        for reply in replies {
-                            connection.buffer_frame(reply).await?;
-                        }
-                        if let Next::Close = next {
-                            connection.flush().await?;
+                        if let Next::Close = session.execute(args) {
+                            session.push_replies();
+                            session.outbox.finish().await?;
                             return Ok(());
                         }
-                        match connection.buffered_request() {
+                        match reader.buffered_request() {
                             Ok(Some(more)) => args = more,
                             Ok(None) => break,
-                            Err(error) => return protocol_error(&mut connection, error).await,
+                            Err(error) => return protocol_error(&mut session, error).await,
                         }
                     }
-                    // Subscribers this batch published to send its messages now, each
-                    // with one write.
-                    session.wakes.wake_all();
-                    connection.flush().await?;
+                    session.push_replies();
+                    // This client's replies first, without waiting, then the messages
+                    // this batch published, each subscriber's with one write. Waiting
+                    // for a full socket comes last, so a client that is slow to read
+                    // its replies doesn't hold up its subscribers.
+                    session.outbox.write_now();
+                    let wrote_to_others = session.wakes.write_all();
+                    session.outbox.flush().await?;
+                    // Writing to other clients makes a batch long. While this client's
+                    // next batch is already waiting, the reads above don't yield, so
+                    // without this the task would run batch after batch in one poll
+                    // (until tokio's budget of about 128 runs out), and no other
+                    // worker would collect socket events meanwhile: other clients then
+                    // waited for 100+ ms. Like Redis's event loop, serve each client
+                    // one batch at a time.
+                    if wrote_to_others {
+                        tokio::task::yield_now().await;
+                    }
                 }
-                () = session.subscriptions.ready() => {
-                    if session.subscriptions.overflowed() {
+                () = session.outbox.ready() => {
+                    if session.outbox.overflowed() {
                         anyhow::bail!(
                             "closed subscriber: over {} MB of messages queued",
                             QUEUE_LIMIT_BYTES / (1024 * 1024)
                         );
                     }
-                    // Send everything queued in one write.
-                    let messages = session.subscriptions.take_queued();
-                    if !messages.is_empty() {
-                        connection.buffer_encoded(&messages).await?;
-                        connection.flush().await?;
-                    }
-                    session.subscriptions.recycle(messages);
+                    session.outbox.flush().await?;
                 }
             }
         }
@@ -128,54 +134,67 @@ enum Next {
 /// connection's subscriptions from the db.
 struct Session {
     db: Db,
+    /// Everything sent to the client: replies, and messages published to it.
+    outbox: Outbox,
+    /// Replies not yet moved to the outbox, so a batch takes its lock once.
+    replies: BytesMut,
     subscriptions: Subscriptions,
-    /// Subscribers this connection's PUBLISHes queued messages for, woken after each
+    /// Subscribers this connection's PUBLISHes queued messages for, sent to after each
     /// batch of requests.
     wakes: Wakes,
 }
 
 impl Session {
-    fn new(db: Db) -> Self {
+    fn new(db: Db, outbox: Outbox) -> Self {
         Self {
             db,
-            subscriptions: Subscriptions::new(),
+            subscriptions: Subscriptions::new(outbox.clone()),
+            outbox,
+            replies: BytesMut::new(),
             wakes: Wakes::default(),
         }
     }
 
-    /// Runs one request. Returns the encoded messages already queued for this connection,
-    /// which go out before the replies as in Redis, then the replies.
+    /// Runs one request, encoding its replies.
     ///
     /// The db lock is only held for the step of a command that reads or changes
-    /// shared state. SUBSCRIBE, UNSUBSCRIBE and RESET also take the queued messages
-    /// under the lock, so that no message for a channel can arrive after its
-    /// unsubscribe acknowledgment. For other commands it is enough to take what is
-    /// queued when the command runs: a PUBLISH that finished earlier has already
-    /// queued its message, and one running concurrently may land on either side, as
-    /// in Redis.
-    fn execute(&mut self, args: Vec<Bytes>) -> (BytesMut, Vec<Frame>, Next) {
+    /// shared state. Messages reach the outbox under the db lock, so SUBSCRIBE,
+    /// UNSUBSCRIBE and RESET move their replies to the outbox before releasing it: a
+    /// channel's messages then come after its subscribe acknowledgment and before its
+    /// unsubscribe acknowledgment, as in Redis. Other replies of a subscribed
+    /// connection are moved right after their command; a PUBLISH running concurrently
+    /// may land on either side of them, as in Redis.
+    fn execute(&mut self, args: Vec<Bytes>) -> Next {
+        let next = self.run(args);
+        if !self.subscriptions.is_empty() {
+            self.push_replies();
+        }
+        next
+    }
+
+    fn run(&mut self, args: Vec<Bytes>) -> Next {
         let command = match Command::from_args(args) {
             Ok(command) => command,
-            Err(message) => return self.reply(vec![error_frame(message)], Next::Continue),
+            Err(message) => return self.reply(error_frame(message), Next::Continue),
         };
         if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
             let error = error_frame(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
                 command.name()
             ));
-            return self.reply(vec![error], Next::Continue);
+            return self.reply(error, Next::Continue);
         }
 
         match command {
             Command::Get(cmd) => {
                 let value = lock(&self.db).entries.get(cmd.key()).cloned();
-                self.reply(vec![value.map_or(Frame::Null, Frame::Bulk)], Next::Continue)
+                self.reply(value.map_or(Frame::Null, Frame::Bulk), Next::Continue)
             }
             Command::Set(cmd) => {
                 lock(&self.db)
                     .entries
                     .insert(cmd.key().clone(), cmd.value());
-                self.reply(vec![Frame::Simple("OK".into())], Next::Continue)
+                self.reply(Frame::Simple("OK".into()), Next::Continue)
             }
             Command::Publish(cmd) => {
                 let receivers = subscription::publish(
@@ -184,43 +203,45 @@ impl Session {
                     cmd.message(),
                     &mut self.wakes,
                 );
-                self.reply(vec![Frame::Integer(receivers as i64)], Next::Continue)
+                self.reply(Frame::Integer(receivers as i64), Next::Continue)
             }
             Command::Subscribe(cmd) => {
-                let mut state = lock(&self.db);
-                let messages = self.subscriptions.take_queued();
-                let mut replies = Vec::with_capacity(cmd.channels().len());
+                let db = self.db.clone();
+                let mut state = lock(&db);
                 for channel in cmd.channels() {
                     self.subscriptions.subscribe(&mut state, channel.clone());
-                    replies.push(push_frame(
+                    push_frame(
                         "subscribe",
                         Frame::Bulk(channel.clone()),
                         self.subscriptions.count(),
-                    ));
+                    )
+                    .encode(&mut self.replies);
                 }
-                (messages, replies, Next::Continue)
+                self.push_replies_locked(&state);
+                Next::Continue
             }
             Command::Unsubscribe(cmd) => {
-                let mut state = lock(&self.db);
-                let messages = self.subscriptions.take_queued();
+                let db = self.db.clone();
+                let mut state = lock(&db);
                 let channels = if cmd.channels().is_empty() {
                     self.subscriptions.channels()
                 } else {
                     cmd.channels().to_vec()
                 };
-                let mut replies = Vec::with_capacity(channels.len().max(1));
                 if channels.is_empty() {
-                    replies.push(push_frame("unsubscribe", Frame::Null, 0));
+                    push_frame("unsubscribe", Frame::Null, 0).encode(&mut self.replies);
                 }
                 for channel in channels {
                     self.subscriptions.unsubscribe(&mut state, &channel);
-                    replies.push(push_frame(
+                    push_frame(
                         "unsubscribe",
                         Frame::Bulk(channel),
                         self.subscriptions.count(),
-                    ));
+                    )
+                    .encode(&mut self.replies);
                 }
-                (messages, replies, Next::Continue)
+                self.push_replies_locked(&state);
+                Next::Continue
             }
             Command::Ping(message) => {
                 let pong = if self.subscriptions.is_empty() {
@@ -231,26 +252,34 @@ impl Session {
                         Frame::Bulk(message.unwrap_or_default()),
                     ])
                 };
-                self.reply(vec![pong], Next::Continue)
+                self.reply(pong, Next::Continue)
             }
-            Command::Quit => self.reply(vec![Frame::Simple("OK".into())], Next::Close),
+            Command::Quit => self.reply(Frame::Simple("OK".into()), Next::Close),
             Command::Reset => {
-                let mut state = lock(&self.db);
-                let messages = self.subscriptions.take_queued();
+                let db = self.db.clone();
+                let mut state = lock(&db);
                 self.subscriptions.unsubscribe_all(&mut state);
-                (
-                    messages,
-                    vec![Frame::Simple("RESET".into())],
-                    Next::Continue,
-                )
+                Frame::Simple("RESET".into()).encode(&mut self.replies);
+                self.push_replies_locked(&state);
+                Next::Continue
             }
         }
     }
 
-    /// Pairs `replies` with the messages queued so far, taken without the db lock,
-    /// for commands that don't change subscriptions (see `execute`).
-    fn reply(&mut self, replies: Vec<Frame>, next: Next) -> (BytesMut, Vec<Frame>, Next) {
-        (self.subscriptions.take_queued(), replies, next)
+    fn reply(&mut self, reply: Frame, next: Next) -> Next {
+        reply.encode(&mut self.replies);
+        next
+    }
+
+    /// Moves the encoded replies to the outbox.
+    fn push_replies(&mut self) {
+        self.outbox.push(&mut self.replies);
+    }
+
+    /// `push_replies` while holding the db lock, which orders the replies with respect
+    /// to messages; taking the guard makes the caller hold it.
+    fn push_replies_locked(&mut self, _state: &State) {
+        self.push_replies();
     }
 }
 
@@ -275,16 +304,16 @@ fn push_frame(kind: &'static str, channel: Frame, count: usize) -> Frame {
     ])
 }
 
-/// Replies with a protocol error, sending any replies already buffered first, then
+/// Replies with a protocol error, sending any replies already encoded first, then
 /// closes the connection by returning.
 async fn protocol_error(
-    connection: &mut Connection,
+    session: &mut Session,
     ProtocolError(message): ProtocolError,
 ) -> anyhow::Result<()> {
-    connection
-        .buffer_frame(error_frame(format!("ERR Protocol error: {message}")))
-        .await?;
-    connection.flush().await
+    error_frame(format!("ERR Protocol error: {message}")).encode(&mut session.replies);
+    session.push_replies();
+    session.outbox.finish().await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -388,5 +417,186 @@ mod tests {
 
         drop(subscriber);
         wait_for_channel_count(&db, 0).await;
+    }
+
+    /// Reads the next frame, failing the test on a timeout, a closed connection or
+    /// bytes that don't parse, which is what interleaved writes would produce.
+    async fn next_frame(connection: &mut Connection) -> Frame {
+        timeout(Duration::from_secs(10), connection.read_frame())
+            .await
+            .expect("no frame")
+            .expect("malformed frame")
+            .expect("connection closed")
+    }
+
+    /// `[kind, channel, payload]` of a pub/sub push, or `None` for any other frame.
+    fn push_parts(frame: &Frame) -> Option<(Bytes, Bytes, Frame)> {
+        match frame {
+            Frame::Array(parts) if parts.len() == 3 => match (&parts[0], &parts[1], &parts[2]) {
+                (Frame::Bulk(kind), Frame::Bulk(channel), Frame::Bulk(payload)) => {
+                    Some((kind.clone(), channel.clone(), Frame::Bulk(payload.clone())))
+                }
+                (Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(count)) => {
+                    Some((kind.clone(), channel.clone(), Frame::Integer(*count)))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Several publishers write to the subscriber's socket while the subscriber's own
+    /// task writes PING replies to it. Every frame must arrive whole, each publisher's
+    /// messages complete and in order, and every PING answered. The subscriber pauses
+    /// now and then, so its socket fills up: writes are then partial and the writer
+    /// token is handed over, which is when stray writes would split a frame.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_keep_frames_whole_and_ordered() {
+        const PUBLISHERS: usize = 4;
+        const MESSAGES: usize = 600;
+        const PIPELINE: usize = 50;
+        let (address, _db) = start().await;
+        let mut subscriber = connect(&address).await;
+        request(&mut subscriber, Subscribe::new("c").into_frame()).await;
+
+        let mut publishers = Vec::new();
+        for publisher in 0..PUBLISHERS {
+            let address = address.clone();
+            publishers.push(tokio::spawn(async move {
+                let mut connection = connect(&address).await;
+                for batch in (0..MESSAGES).collect::<Vec<_>>().chunks(PIPELINE) {
+                    for &seq in batch {
+                        let size = if seq % 7 == 0 { 32 * 1024 } else { 64 };
+                        let mut payload = format!("{publisher}:{seq}:").into_bytes();
+                        payload.resize(size, b'x');
+                        let frame = Publish::new("c", Bytes::from(payload)).into_frame();
+                        connection.write_frame(frame).await.unwrap();
+                    }
+                    for _ in batch {
+                        next_frame(&mut connection).await;
+                    }
+                }
+            }));
+        }
+
+        let mut next_seq = [0usize; PUBLISHERS];
+        let (mut pings, mut pongs) = (0, 0);
+        while next_seq.iter().any(|&seq| seq < MESSAGES) || pongs < pings {
+            if pings < 200 && next_seq.iter().sum::<usize>() % 10 == 0 {
+                subscriber
+                    .write_frame(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+                    .await
+                    .unwrap();
+                pings += 1;
+            }
+            if (next_seq.iter().sum::<usize>() + pongs) % 100 == 99 {
+                sleep(Duration::from_millis(2)).await;
+            }
+            let frame = next_frame(&mut subscriber).await;
+            if matches!(&frame, Frame::Array(parts) if parts.len() == 2) {
+                pongs += 1;
+                continue;
+            }
+            let (kind, channel, payload) = push_parts(&frame).expect("unexpected frame");
+            assert_eq!((&kind[..], &channel[..]), (&b"message"[..], &b"c"[..]));
+            let payload = match payload {
+                Frame::Bulk(payload) => payload,
+                _ => panic!("message without a payload"),
+            };
+            let text = String::from_utf8_lossy(&payload);
+            let mut fields = text.split(':');
+            let publisher: usize = fields.next().unwrap().parse().unwrap();
+            let seq: usize = fields.next().unwrap().parse().unwrap();
+            assert_eq!(
+                seq, next_seq[publisher],
+                "publisher {publisher} out of order"
+            );
+            assert!(payload.len() == 64 || payload.len() == 32 * 1024);
+            next_seq[publisher] += 1;
+        }
+        for publisher in publishers {
+            publisher.await.unwrap();
+        }
+        assert_eq!(pongs, pings);
+    }
+
+    /// While a publisher publishes without pause, no message may arrive between an
+    /// UNSUBSCRIBE acknowledgment and the next SUBSCRIBE acknowledgment, and each
+    /// subscription's messages arrive in order.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn acknowledgments_stay_ordered_with_messages_under_load() {
+        let (address, _db) = start().await;
+        let mut subscriber = connect(&address).await;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let publisher = {
+            let (address, stop) = (address.clone(), stop.clone());
+            tokio::spawn(async move {
+                let mut connection = connect(&address).await;
+                let mut seq = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    for _ in 0..16 {
+                        let frame = Publish::new("c", Bytes::from(seq.to_string())).into_frame();
+                        connection.write_frame(frame).await.unwrap();
+                        seq += 1;
+                    }
+                    for _ in 0..16 {
+                        next_frame(&mut connection).await;
+                    }
+                }
+            })
+        };
+
+        for _ in 0..50 {
+            subscriber
+                .write_frame(Subscribe::new("c").into_frame())
+                .await
+                .unwrap();
+            let ack = next_frame(&mut subscriber).await;
+            assert_eq!(
+                push_parts(&ack).map(|(kind, _, _)| kind),
+                Some(Bytes::from_static(b"subscribe")),
+                "expected the subscribe acknowledgment first"
+            );
+            // Let some messages through, then unsubscribe while they keep coming.
+            let mut last = None;
+            let mut seen = 0;
+            subscriber
+                .write_frame(Unsubscribe::new(vec!["c".into()]).into_frame())
+                .await
+                .unwrap();
+            loop {
+                let frame = next_frame(&mut subscriber).await;
+                let (kind, _, payload) = push_parts(&frame).expect("unexpected frame");
+                if &kind[..] == b"unsubscribe" {
+                    break;
+                }
+                assert_eq!(&kind[..], b"message");
+                let payload = match payload {
+                    Frame::Bulk(payload) => payload,
+                    _ => panic!("message without a payload"),
+                };
+                let seq: u64 = String::from_utf8_lossy(&payload).parse().unwrap();
+                assert!(
+                    last.is_none_or(|last| seq == last + 1),
+                    "messages out of order"
+                );
+                last = Some(seq);
+                seen += 1;
+            }
+            let _ = seen;
+            // Nothing for "c" may follow the unsubscribe acknowledgment: the next
+            // frame must be the reply to this PING.
+            subscriber
+                .write_frame(Frame::Array(vec![Frame::Bulk(Bytes::from_static(b"PING"))]))
+                .await
+                .unwrap();
+            let pong = next_frame(&mut subscriber).await;
+            assert!(
+                matches!(&pong, Frame::Simple(text) if text == "PONG"),
+                "a message arrived after the unsubscribe acknowledgment: {pong:?}"
+            );
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        publisher.await.unwrap();
     }
 }
