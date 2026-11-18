@@ -28,7 +28,7 @@ use bytes::{Buf, BytesMut};
 use clap::Parser;
 use my_redis::client::Client;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +44,10 @@ struct Options {
     /// starting one. Server CPU and memory can't be measured then.
     #[arg(long)]
     address: Option<String>,
+    /// The my-mini-redis server binary to start, fresh for every run, instead of the
+    /// one built with this benchmark: for comparing builds (see scripts/compare.sh).
+    #[arg(long, conflicts_with = "address")]
+    server: Option<PathBuf>,
     /// Compare against a Redis that is already running (host:port) instead of starting
     /// one. Server CPU and memory can't be measured then.
     #[arg(long)]
@@ -57,6 +61,9 @@ struct Options {
     /// Only run the summary scenarios and the memory section; skip the sweeps.
     #[arg(long)]
     quick: bool,
+    /// Skip the memory section (idle footprint, memory per connection and per key).
+    #[arg(long)]
+    no_memory: bool,
     /// Seconds to measure each summary scenario.
     #[arg(long, default_value_t = 5.0)]
     duration: f64,
@@ -236,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
         None => ServerSpec::new(
             "my-mini-redis",
             Kind::Mini {
+                binary: mini_binary(&options),
                 worker_threads: None,
             },
         ),
@@ -278,7 +286,9 @@ async fn main() -> anyhow::Result<()> {
     };
     bench.total = bench.planned_runs();
 
-    bench.memory_section().await?;
+    if !options.no_memory {
+        bench.memory_section().await?;
+    }
     bench.summary_section().await?;
     if !options.quick {
         bench.sweep_sections().await?;
@@ -544,6 +554,7 @@ impl Bench {
         let spec = ServerSpec::new(
             "my-mini-redis, 1 thread",
             Kind::Mini {
+                binary: mini_binary(&self.options),
                 worker_threads: Some(1),
             },
         );
@@ -590,11 +601,26 @@ struct ServerSpec {
 
 enum Kind {
     /// This project's server binary, started fresh for every run.
-    Mini { worker_threads: Option<usize> },
+    Mini {
+        binary: PathBuf,
+        worker_threads: Option<usize>,
+    },
     /// A redis-server binary, started fresh for every run.
     Redis(String),
     /// An already running server; its CPU and memory can't be measured.
     External(String),
+}
+
+/// The server binary built together with this benchmark.
+const BUILT_SERVER: &str = env!("CARGO_BIN_EXE_my-mini-redis-server");
+
+/// The my-mini-redis binary to start: `--server` if given, else the one built with this
+/// benchmark.
+fn mini_binary(options: &Options) -> PathBuf {
+    options
+        .server
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(BUILT_SERVER))
 }
 
 impl ServerSpec {
@@ -608,6 +634,9 @@ impl ServerSpec {
     fn describe(&self) -> String {
         match &self.kind {
             Kind::External(address) => format!("already running at {address}"),
+            Kind::Mini { binary, .. } if binary != Path::new(BUILT_SERVER) => {
+                format!("`{}`, fresh process per run", binary.display())
+            }
             _ => "fresh process per run".into(),
         }
     }
@@ -625,8 +654,11 @@ impl ServerSpec {
             _ => free_address()?,
         };
         let command = match &self.kind {
-            Kind::Mini { worker_threads } => {
-                let mut command = Command::new(env!("CARGO_BIN_EXE_my-mini-redis-server"));
+            Kind::Mini {
+                binary,
+                worker_threads,
+            } => {
+                let mut command = Command::new(binary);
                 command.env("MY_MINI_REDIS_ADDRESS", &address);
                 if let Some(threads) = worker_threads {
                     // Read by tokio's multi-threaded runtime.
@@ -1494,7 +1526,9 @@ impl Bench {
         );
 
         self.summary_tables(&mut md);
-        self.memory_table(&mut md);
+        if !self.memory.is_empty() {
+            self.memory_table(&mut md);
+        }
         if !o.quick {
             for (sweep, title) in SWEEPS {
                 self.sweep_table(&mut md, sweep, title);
