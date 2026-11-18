@@ -4,7 +4,7 @@ use crate::frame::Frame;
 use crate::outbox::{Outbox, QUEUE_LIMIT_BYTES};
 use crate::request::ProtocolError;
 use crate::subscription::{self, Subscriptions, Wakes};
-use crate::{DEFAULT_ADDRESS, Db, Registry, lock};
+use crate::{DEFAULT_ADDRESS, Db, lock};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
@@ -72,51 +72,16 @@ impl Server {
         loop {
             tokio::select! {
                 request = reader.read_request() => {
-                    let mut args = match request {
+                    let args = match request {
                         Ok(Some(args)) => args,
                         Ok(None) => return Ok(()),
                         Err(ReadRequestError::Protocol(error)) => {
-                            return protocol_error(&mut session, error).await;
+                            return session.protocol_error(error).await;
                         }
                         Err(ReadRequestError::Io(error)) => return Err(error),
                     };
-                    // Run every request that has already arrived, then send all the
-                    // replies with one write instead of one per reply.
-                    let mut commands = 0;
-                    loop {
-                        commands += 1;
-                        if let Next::Close = session.execute(args) {
-                            session.push_replies();
-                            session.outbox.finish().await?;
-                            return Ok(());
-                        }
-                        match reader.buffered_request() {
-                            Ok(Some(more)) => args = more,
-                            Ok(None) => break,
-                            Err(error) => return protocol_error(&mut session, error).await,
-                        }
-                    }
-                    session.push_replies();
-                    // This client's replies first, without waiting, then the messages
-                    // this batch published, each subscriber's with one write. Waiting
-                    // for a full socket comes last, so a client that is slow to read
-                    // its replies doesn't hold up its subscribers.
-                    session.outbox.write_now();
-                    let wrote_to_others = session.wakes.write_all();
-                    session.outbox.flush().await?;
-                    // Like Redis's event loop, serve each client one batch at a time.
-                    // While a client's next batch is already waiting, the read above
-                    // doesn't yield, so without this the task would run batch after
-                    // batch in one poll (until tokio's budget of about 128 runs out),
-                    // and no other worker would collect socket events meanwhile:
-                    // publishers then waited 100+ ms behind other publishers, and
-                    // PUBLISH ran at a quarter of its rate behind pipelined SETs.
-                    // A single command that wrote to nobody else is skipped: its
-                    // client almost always waits for the reply, so the next read
-                    // suspends the task anyway, and yielding would only add a
-                    // scheduler round trip (12% more CPU per request, measured).
-                    if commands > 1 || wrote_to_others {
-                        tokio::task::yield_now().await;
+                    if let Next::Close = session.serve_batch(&mut reader, args).await? {
+                        return Ok(());
                     }
                 }
                 () = session.outbox.ready() => {
@@ -161,6 +126,69 @@ impl Session {
             replies: BytesMut::new(),
             wakes: Wakes::default(),
         }
+    }
+
+    /// Runs `args`, then every further request already received, and sends the
+    /// replies with one write instead of one per reply. Returns `Next::Close` once the
+    /// connection has been closed: by QUIT, or after a protocol error.
+    ///
+    /// This client's replies go out first, without waiting, then the messages the
+    /// batch published, each subscriber's with one write. Waiting for a full socket
+    /// comes last, so a client that is slow to read its replies doesn't hold up its
+    /// subscribers.
+    ///
+    /// Like Redis's event loop, each client is served one batch at a time: the task
+    /// yields after a batch. While a client's next batch is already waiting, reading
+    /// it doesn't yield, so without this the task would run batch after batch in one
+    /// poll (until tokio's budget of about 128 runs out), and no other worker would
+    /// collect socket events meanwhile: publishers then waited 100+ ms behind other
+    /// publishers, and PUBLISH ran at a quarter of its rate behind pipelined SETs. A
+    /// single command that wrote to nobody else doesn't yield: its client almost
+    /// always waits for the reply, so the next read suspends the task anyway, and
+    /// yielding would only add a scheduler round trip (12% more CPU per request,
+    /// measured).
+    async fn serve_batch(
+        &mut self,
+        reader: &mut RequestReader,
+        mut args: Vec<Bytes>,
+    ) -> anyhow::Result<Next> {
+        let mut commands = 0;
+        loop {
+            commands += 1;
+            if let Next::Close = self.execute(args) {
+                self.push_replies();
+                self.outbox.finish().await?;
+                return Ok(Next::Close);
+            }
+            match reader.buffered_request() {
+                Ok(Some(more)) => args = more,
+                Ok(None) => break,
+                Err(error) => {
+                    self.protocol_error(error).await?;
+                    return Ok(Next::Close);
+                }
+            }
+        }
+        self.push_replies();
+        self.outbox.write_now();
+        let wrote_to_others = self.wakes.write_all();
+        self.outbox.flush().await?;
+        if commands > 1 || wrote_to_others {
+            tokio::task::yield_now().await;
+        }
+        Ok(Next::Continue)
+    }
+
+    /// Replies with a protocol error, sending any replies already encoded first. The
+    /// caller then closes the connection.
+    async fn protocol_error(
+        &mut self,
+        ProtocolError(message): ProtocolError,
+    ) -> anyhow::Result<()> {
+        error_frame(format!("ERR Protocol error: {message}")).encode(&mut self.replies);
+        self.push_replies();
+        self.outbox.finish().await?;
+        Ok(())
     }
 
     /// Runs one request, encoding its replies.
@@ -214,44 +242,8 @@ impl Session {
                 );
                 self.reply(Frame::Integer(receivers as i64), Next::Continue)
             }
-            Command::Subscribe(cmd) => {
-                let db = self.db.clone();
-                let mut registry = lock(&db.registry);
-                for channel in cmd.channels() {
-                    self.subscriptions.subscribe(&mut registry, channel.clone());
-                    push_frame(
-                        "subscribe",
-                        Frame::Bulk(channel.clone()),
-                        self.subscriptions.count(),
-                    )
-                    .encode(&mut self.replies);
-                }
-                self.push_replies_locked(&registry);
-                Next::Continue
-            }
-            Command::Unsubscribe(cmd) => {
-                let db = self.db.clone();
-                let mut registry = lock(&db.registry);
-                let channels = if cmd.channels().is_empty() {
-                    self.subscriptions.channels()
-                } else {
-                    cmd.channels().to_vec()
-                };
-                if channels.is_empty() {
-                    push_frame("unsubscribe", Frame::Null, 0).encode(&mut self.replies);
-                }
-                for channel in channels {
-                    self.subscriptions.unsubscribe(&mut registry, &channel);
-                    push_frame(
-                        "unsubscribe",
-                        Frame::Bulk(channel),
-                        self.subscriptions.count(),
-                    )
-                    .encode(&mut self.replies);
-                }
-                self.push_replies_locked(&registry);
-                Next::Continue
-            }
+            Command::Subscribe(cmd) => self.subscribe(cmd.channels()),
+            Command::Unsubscribe(cmd) => self.unsubscribe(cmd.channels()),
             Command::Ping(message) => {
                 let pong = if self.subscriptions.is_empty() {
                     message.map_or(Frame::Simple("PONG".into()), Frame::Bulk)
@@ -264,15 +256,50 @@ impl Session {
                 self.reply(pong, Next::Continue)
             }
             Command::Quit => self.reply(Frame::Simple("OK".into()), Next::Close),
-            Command::Reset => {
-                let db = self.db.clone();
-                let mut registry = lock(&db.registry);
-                self.subscriptions.unsubscribe_all(&mut registry);
-                Frame::Simple("RESET".into()).encode(&mut self.replies);
-                self.push_replies_locked(&registry);
-                Next::Continue
-            }
+            Command::Reset => self.reset(),
         }
+    }
+
+    // SUBSCRIBE, UNSUBSCRIBE and RESET move their replies to the outbox while still
+    // holding the pub/sub lock, so they are ordered with the channels' messages.
+
+    fn subscribe(&mut self, channels: &[Bytes]) -> Next {
+        let mut registry = lock(&self.db.registry);
+        for channel in channels {
+            self.subscriptions.subscribe(&mut registry, channel.clone());
+            let count = self.subscriptions.count();
+            push_frame("subscribe", Frame::Bulk(channel.clone()), count).encode(&mut self.replies);
+        }
+        self.outbox.push(&mut self.replies);
+        Next::Continue
+    }
+
+    /// Unsubscribes from `channels`, or from every channel if it is empty.
+    fn unsubscribe(&mut self, channels: &[Bytes]) -> Next {
+        let mut registry = lock(&self.db.registry);
+        let channels = if channels.is_empty() {
+            self.subscriptions.channels()
+        } else {
+            channels.to_vec()
+        };
+        if channels.is_empty() {
+            push_frame("unsubscribe", Frame::Null, 0).encode(&mut self.replies);
+        }
+        for channel in channels {
+            self.subscriptions.unsubscribe(&mut registry, &channel);
+            let count = self.subscriptions.count();
+            push_frame("unsubscribe", Frame::Bulk(channel), count).encode(&mut self.replies);
+        }
+        self.outbox.push(&mut self.replies);
+        Next::Continue
+    }
+
+    fn reset(&mut self) -> Next {
+        let mut registry = lock(&self.db.registry);
+        self.subscriptions.unsubscribe_all(&mut registry);
+        Frame::Simple("RESET".into()).encode(&mut self.replies);
+        self.outbox.push(&mut self.replies);
+        Next::Continue
     }
 
     fn reply(&mut self, reply: Frame, next: Next) -> Next {
@@ -283,12 +310,6 @@ impl Session {
     /// Moves the encoded replies to the outbox.
     fn push_replies(&mut self) {
         self.outbox.push(&mut self.replies);
-    }
-
-    /// `push_replies` while holding the pub/sub lock, which orders the replies with
-    /// respect to messages; taking the guard makes the caller hold it.
-    fn push_replies_locked(&mut self, _registry: &Registry) {
-        self.push_replies();
     }
 }
 
@@ -311,18 +332,6 @@ fn push_frame(kind: &'static str, channel: Frame, count: usize) -> Frame {
         channel,
         Frame::Integer(count as i64),
     ])
-}
-
-/// Replies with a protocol error, sending any replies already encoded first, then
-/// closes the connection by returning.
-async fn protocol_error(
-    session: &mut Session,
-    ProtocolError(message): ProtocolError,
-) -> anyhow::Result<()> {
-    error_frame(format!("ERR Protocol error: {message}")).encode(&mut session.replies);
-    session.push_replies();
-    session.outbox.finish().await?;
-    Ok(())
 }
 
 #[cfg(test)]
