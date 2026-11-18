@@ -1,6 +1,6 @@
 use super::frame::Error as FrameError;
 use super::frame::Frame;
-use super::request::{self, Parsed, ProtocolError};
+use super::request::{Parser, ProtocolError};
 use anyhow;
 use bytes::{Buf, Bytes, BytesMut};
 use std::io::{Cursor, Error, ErrorKind};
@@ -27,6 +27,8 @@ pub(crate) struct RequestReader {
     // instead of `readable` and `try_read`, which cost a second `recvfrom` per request.
     socket: OwnedReadHalf,
     buffer: BytesMut,
+    /// Keeps a partly received request between reads.
+    parser: Parser,
     /// Space reserved for the next read, between `READ_SIZE` and `MAX_READ_SIZE`.
     read_size: usize,
 }
@@ -149,6 +151,7 @@ impl RequestReader {
         Self {
             socket,
             buffer: BytesMut::with_capacity(READ_SIZE),
+            parser: Parser::default(),
             read_size: READ_SIZE,
         }
     }
@@ -191,14 +194,9 @@ impl RequestReader {
     /// skipped.
     pub(crate) fn buffered_request(&mut self) -> Result<Option<Vec<Bytes>>, ProtocolError> {
         loop {
-            match request::parse(&self.buffer)? {
-                Parsed::Request { args, consumed } => {
-                    self.buffer.advance(consumed);
-                    if !args.is_empty() {
-                        return Ok(Some(args));
-                    }
-                }
-                Parsed::Incomplete => return Ok(None),
+            match self.parser.parse(&mut self.buffer)? {
+                Some(args) if args.is_empty() => {}
+                request => return Ok(request),
             }
         }
     }
