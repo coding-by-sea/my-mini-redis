@@ -11,6 +11,8 @@ anyhow = "1.0.20"
 atoi = "3"
 clap = { version = "4.4.2", features = ["derive"] }
 dashmap = "6.2.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "env-filter", "ansi", "std"] }
 
 [[bin]]
 name = "my-redis-cli"
