@@ -1,3 +1,4 @@
+use super::to_bytes;
 use crate::frame::Frame;
 use bytes::Bytes;
 
@@ -6,16 +7,13 @@ pub struct Subscribe {
 }
 
 impl Subscribe {
-    pub fn new(channel: impl ToString) -> Self {
+    pub fn new(channel: impl AsRef<[u8]>) -> Self {
         Self::new_multiple([channel])
     }
 
-    pub fn new_multiple(channels: impl IntoIterator<Item = impl ToString>) -> Self {
+    pub fn new_multiple(channels: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Self {
         Self {
-            channels: channels
-                .into_iter()
-                .map(|channel| Bytes::from(channel.to_string()))
-                .collect(),
+            channels: channels.into_iter().map(to_bytes).collect(),
         }
     }
 

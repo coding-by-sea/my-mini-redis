@@ -1,3 +1,4 @@
+use super::to_bytes;
 use crate::frame::Frame;
 use bytes::Bytes;
 
@@ -7,9 +8,9 @@ pub struct Set {
 }
 
 impl Set {
-    pub fn new(key: impl ToString, value: Bytes) -> Self {
+    pub fn new(key: impl AsRef<[u8]>, value: Bytes) -> Self {
         Self {
-            key: Bytes::from(key.to_string()),
+            key: to_bytes(key),
             value,
         }
     }
@@ -30,8 +31,8 @@ impl Set {
         &self.key
     }
 
-    pub fn value(&self) -> Bytes {
-        self.value.clone()
+    pub fn value(&self) -> &Bytes {
+        &self.value
     }
 
     pub fn into_frame(self) -> Frame {

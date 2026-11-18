@@ -15,6 +15,11 @@ pub use publish::Publish;
 
 use bytes::Bytes;
 
+/// Copies a key, channel or other argument given as text or bytes. Binary safe.
+fn to_bytes(arg: impl AsRef<[u8]>) -> Bytes {
+    Bytes::copy_from_slice(arg.as_ref())
+}
+
 pub(crate) enum Command {
     Get(Get),
     Set(Set),

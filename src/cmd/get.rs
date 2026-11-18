@@ -1,3 +1,4 @@
+use super::to_bytes;
 use crate::frame::Frame;
 use bytes::Bytes;
 
@@ -6,10 +7,8 @@ pub struct Get {
 }
 
 impl Get {
-    pub fn new(key: impl ToString) -> Self {
-        Self {
-            key: Bytes::from(key.to_string()),
-        }
+    pub fn new(key: impl AsRef<[u8]>) -> Self {
+        Self { key: to_bytes(key) }
     }
 
     /// Parses `GET key`; the arity was already checked.
