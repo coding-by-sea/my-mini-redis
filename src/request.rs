@@ -163,7 +163,7 @@ fn split_args(line: &[u8]) -> Option<Vec<Bytes>> {
     let mut args = Vec::new();
     let mut i = 0;
     loop {
-        while i < line.len() && line[i].is_ascii_whitespace() {
+        while line.get(i).is_some_and(u8::is_ascii_whitespace) {
             i += 1;
         }
         if i == line.len() {
@@ -171,78 +171,80 @@ fn split_args(line: &[u8]) -> Option<Vec<Bytes>> {
         }
 
         let mut arg = Vec::new();
-        let mut in_double = false;
-        let mut in_single = false;
+        let mut quote = Quote::None;
         loop {
             let Some(&c) = line.get(i) else {
-                if in_double || in_single {
+                if quote != Quote::None {
                     return None;
                 }
                 break;
             };
-            if in_double {
-                match c {
-                    b'\\'
-                        if i + 3 < line.len()
-                            && line[i + 1] == b'x'
-                            && line[i + 2].is_ascii_hexdigit()
-                            && line[i + 3].is_ascii_hexdigit() =>
-                    {
-                        arg.push(hex_value(line[i + 2]) * 16 + hex_value(line[i + 3]));
-                        i += 3;
-                    }
-                    b'\\' if i + 1 < line.len() => {
-                        i += 1;
-                        arg.push(match line[i] {
-                            b'n' => b'\n',
-                            b'r' => b'\r',
-                            b't' => b'\t',
-                            b'b' => 0x08,
-                            b'a' => 0x07,
-                            other => other,
-                        });
-                    }
-                    b'"' => {
-                        if line
-                            .get(i + 1)
-                            .is_some_and(|next| !next.is_ascii_whitespace())
+            match quote {
+                Quote::None => match c {
+                    c if c.is_ascii_whitespace() => break,
+                    b'"' => quote = Quote::Double,
+                    b'\'' => quote = Quote::Single,
+                    _ => arg.push(c),
+                },
+                Quote::Double => match c {
+                    b'\\' => match &line[i + 1..] {
+                        [b'x', high, low, ..]
+                            if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() =>
                         {
-                            return None;
+                            arg.push(hex_value(*high) * 16 + hex_value(*low));
+                            i += 3;
                         }
-                        i += 1;
+                        [escaped, ..] => {
+                            arg.push(match escaped {
+                                b'n' => b'\n',
+                                b'r' => b'\r',
+                                b't' => b'\t',
+                                b'b' => 0x08,
+                                b'a' => 0x07,
+                                other => *other,
+                            });
+                            i += 1;
+                        }
+                        // A trailing backslash; the quote is left open.
+                        [] => arg.push(c),
+                    },
+                    b'"' => {
+                        i = after_closing_quote(line, i)?;
                         break;
                     }
                     _ => arg.push(c),
-                }
-            } else if in_single {
-                match c {
+                },
+                Quote::Single => match c {
                     b'\\' if line.get(i + 1) == Some(&b'\'') => {
-                        i += 1;
                         arg.push(b'\'');
+                        i += 1;
                     }
                     b'\'' => {
-                        if line
-                            .get(i + 1)
-                            .is_some_and(|next| !next.is_ascii_whitespace())
-                        {
-                            return None;
-                        }
-                        i += 1;
+                        i = after_closing_quote(line, i)?;
                         break;
                     }
                     _ => arg.push(c),
-                }
-            } else {
-                match c {
-                    c if c.is_ascii_whitespace() => break,
-                    b'"' => in_double = true,
-                    b'\'' => in_single = true,
-                    _ => arg.push(c),
-                }
+                },
             }
             i += 1;
         }
         args.push(Bytes::from(arg));
+    }
+}
+
+#[derive(PartialEq, Eq)]
+enum Quote {
+    None,
+    Double,
+    Single,
+}
+
+/// Returns the position after the closing quote at `i`, or `None` if something other
+/// than whitespace follows it.
+fn after_closing_quote(line: &[u8], i: usize) -> Option<usize> {
+    match line.get(i + 1) {
+        Some(next) if !next.is_ascii_whitespace() => None,
+        _ => Some(i + 1),
     }
 }
 
