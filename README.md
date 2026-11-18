@@ -24,6 +24,29 @@ Key Technics:
 
 ---
 
+## 📊 Performance against Redis
+
+On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, my-mini-redis is ahead on most workloads by spreading them over several cores. 50 connections, pipeline 16, 64 B values unless stated:
+
+| Workload | my-mini-redis | Redis 8.0.2 | mini / Redis |
+|---|---:|---:|---:|
+| SET (pipeline 16) | 7.00M ops/s | 3.04M ops/s | 2.30x |
+| GET (pipeline 16) | 7.65M ops/s | 3.45M ops/s | 2.22x |
+| PING (pipeline 16) | 8.89M ops/s | 4.85M ops/s | 1.83x |
+| SET, pipeline 64 | 14.67M ops/s | 3.88M ops/s | 3.79x |
+| SET, 1 request in flight per connection | 596k ops/s | 488k ops/s | 1.22x |
+| PUBLISH to 50 subscribers on one channel | 252k publishes/s | 284k publishes/s | 0.89x |
+| PUBLISH to 100 subscribers over 100 channels | 801k publishes/s | 605k publishes/s | 1.32x |
+| PUBLISH while 50 connections pipeline SETs | 196k publishes/s | 128k publishes/s | 1.53x |
+
+- **CPU per operation** is 1.9 to 3.0x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (0.96x to 1.04x).
+- **Message delivery latency** under SET load: p99 885 us, against Redis's 975 us.
+- **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 212 B per key with 16 B values against 93 B.
+
+Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchmarks/2026-11-17-full-linux.md](docs/benchmarks/2026-11-17-full-linux.md). The load generator runs on the same machine, so absolute numbers depend on it; the ratios are the comparison.
+
+---
+
 ## 🏗️ Architecture & Data Flow
 
 ### System Architecture
