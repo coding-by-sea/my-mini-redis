@@ -8,7 +8,7 @@
 # is measured. The report is printed and written to target/bench/ (latest.md, and
 # JSON for tracking over time).
 #
-# OPTIONS go to benches/load.rs (`scripts/bench.sh --help`), for example:
+# OPTIONS go to benches/load/ (`scripts/bench.sh --help`), for example:
 #
 #   scripts/bench.sh --quick                         # summary and memory only
 #   scripts/bench.sh --duration 10 --clients 200
