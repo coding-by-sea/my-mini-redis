@@ -16,6 +16,11 @@ import statistics
 import sys
 
 
+# The server's label in benchmark reports; results recorded before the project was
+# renamed from my-mini-redis use the old one.
+SERVER_NAMES = ("my-redis", "my-mini-redis")
+
+
 def load_perf(path):
     """Counter name -> value from a `perf stat -x,` CSV, if the run has one."""
     counters = {}
@@ -44,13 +49,13 @@ def runs_of(root):
 
 
 def parse(run_dir):
-    """One row per my-mini-redis scenario in the run's JSON report."""
+    """One row per my-redis scenario in the run's JSON report."""
     with open(os.path.join(run_dir, "bench", "latest.json")) as f:
         report = json.load(f)
     perf = load_perf(os.path.join(run_dir, "perf.csv"))
     rows = []
     for r in report["runs"]:
-        if r["server"] != "my-mini-redis":
+        if r["server"] not in SERVER_NAMES:
             continue
         delivery = r.get("delivery_latency_ns") or [None] * 5
         # Syscalls are counted over 5 s; per delivery for pub/sub, else per operation.

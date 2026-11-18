@@ -818,7 +818,7 @@ mod accept_failure {
     use super::*;
     use std::process::{Child, Command, Stdio};
 
-    const SERVER_BINARY: &str = env!("CARGO_BIN_EXE_my-mini-redis-server");
+    const SERVER_BINARY: &str = env!("CARGO_BIN_EXE_my-redis-server");
 
     /// Kills the server process when the test ends, even on panic.
     struct ChildGuard(Child);
@@ -844,7 +844,7 @@ mod accept_failure {
                     .arg("-c")
                     .arg("ulimit -n 32 && exec \"$0\"")
                     .arg(SERVER_BINARY)
-                    .env("MY_MINI_REDIS_ADDRESS", &address)
+                    .env("MY_REDIS_ADDRESS", &address)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .spawn()

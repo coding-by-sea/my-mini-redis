@@ -13,11 +13,11 @@ clap = { version = "4.4.2", features = ["derive"] }
 dashmap = "6.2.1"
 
 [[bin]]
-name = "my-mini-redis-cli"
+name = "my-redis-cli"
 path = "src/bin/client.rs"
 
 [[bin]]
-name = "my-mini-redis-server"
+name = "my-redis-server"
 path = "src/bin/server.rs"
 
 [[bench]]

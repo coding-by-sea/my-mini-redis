@@ -40,7 +40,7 @@ Each ratio is against the Redis run from the same session (single runs; the nois
 
 Many channels were already fine before this change (1.10x Redis with 10 channels, 1.33x with 100). The mixed scenario was not:
 
-| Before | my-mini-redis | Redis | mini / Redis |
+| Before | my-redis | Redis | my-redis / Redis |
 |---|---:|---:|---:|
 | PUBLISH alone | 253k/s | 285k/s | 0.89x |
 | PUBLISH during SET | **20k/s**, delivery p99 12.9 ms | 132k/s, 0.88 ms | **0.15x** |
@@ -52,7 +52,7 @@ Many channels were already fine before this change (1.10x Redis with 10 channels
 
 **Unfair scheduling.** A pipelined client whose next batch has already arrived never makes its task wait on the read, so the task runs batch after batch in one poll, until tokio's budget of about 128 runs out, and socket events go uncollected meanwhile. This is the stall the direct-writes work fixed for publishers, which yield after each batch. SET connections didn't yield, so they crowded the publishers out. Now every connection yields after each batch, as Redis's event loop serves each client once per pass, except after a lone command that wrote to no subscribers (see below).
 
-Each fix only shows its full effect once the other is in. Mixed scenario, my-mini-redis only (2 to 3 runs each):
+Each fix only shows its full effect once the other is in. Mixed scenario, my-redis only (2 to 3 runs each):
 
 | | PUBLISH during SET | delivery p99 | SET during PUBLISH |
 |---|---:|---:|---:|

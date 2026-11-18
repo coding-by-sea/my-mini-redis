@@ -1,4 +1,4 @@
-//! Load benchmark: my-mini-redis against a real Redis, under maximum load.
+//! Load benchmark: my-redis against a real Redis, under maximum load.
 //!
 //! ```text
 //! scripts/bench.sh [OPTIONS]                 # recommended: raises the open-file limit
@@ -16,7 +16,7 @@
 //! - Memory: idle footprint, cost per connection and per key.
 //! - Sweeps, varying one thing at a time: pipeline depth (fixed cost per request),
 //!   connections (contention), payload size (cost per byte) and pub/sub fan-out.
-//! - Single-threaded: my-mini-redis limited to one worker thread against Redis, which
+//! - Single-threaded: my-redis limited to one worker thread against Redis, which
 //!   runs commands on one thread.
 //!
 //! The report is printed and written to `target/bench/` as Markdown and JSON.
@@ -38,13 +38,13 @@ use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
 
 #[derive(Parser, Debug, Clone)]
-#[command(about = "Load benchmark: my-mini-redis against a real Redis")]
+#[command(about = "Load benchmark: my-redis against a real Redis")]
 struct Options {
-    /// Benchmark a my-mini-redis that is already running (host:port) instead of
+    /// Benchmark a my-redis that is already running (host:port) instead of
     /// starting one. Server CPU and memory can't be measured then.
     #[arg(long)]
     address: Option<String>,
-    /// The my-mini-redis server binary to start, fresh for every run, instead of the
+    /// The my-redis server binary to start, fresh for every run, instead of the
     /// one built with this benchmark: for comparing builds (see scripts/compare.sh).
     #[arg(long, conflicts_with = "address")]
     server: Option<PathBuf>,
@@ -238,12 +238,12 @@ async fn main() -> anyhow::Result<()> {
     }
     let started_at = std::time::SystemTime::now();
 
-    let mini = match &options.address {
-        Some(address) => ServerSpec::new("my-mini-redis", Kind::External(address.clone())),
+    let my_redis = match &options.address {
+        Some(address) => ServerSpec::new("my-redis", Kind::External(address.clone())),
         None => ServerSpec::new(
-            "my-mini-redis",
-            Kind::Mini {
-                binary: mini_binary(&options),
+            "my-redis",
+            Kind::MyRedis {
+                binary: my_redis_binary(&options),
                 worker_threads: None,
             },
         ),
@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mut bench = Bench {
         options: options.clone(),
-        mini,
+        my_redis,
         redis,
         records: Vec::new(),
         memory: Vec::new(),
@@ -317,7 +317,7 @@ async fn main() -> anyhow::Result<()> {
 
 struct Bench {
     options: Options,
-    mini: ServerSpec,
+    my_redis: ServerSpec,
     redis: Option<ServerSpec>,
     records: Vec<Record>,
     memory: Vec<MemoryProfile>,
@@ -460,7 +460,7 @@ impl Bench {
                 .map(|(sweep, _)| self.sweep_points(sweep).len())
                 .sum::<usize>()
                 * self.servers();
-            runs += 3; // single-threaded my-mini-redis (Redis runs are reused from the summary)
+            runs += 3; // single-threaded my-redis (Redis runs are reused from the summary)
         }
         runs
     }
@@ -474,7 +474,7 @@ impl Bench {
         server: Server,
     ) -> anyhow::Result<()> {
         let spec = match server {
-            Server::Mini => &self.mini,
+            Server::MyRedis => &self.my_redis,
             Server::Redis => self.redis.as_ref().expect("checked by caller"),
         };
         self.progress += 1;
@@ -506,8 +506,14 @@ impl Bench {
         scenario: Scenario,
         load: Load,
     ) -> anyhow::Result<()> {
-        self.run(section, label.clone(), scenario, load.clone(), Server::Mini)
-            .await?;
+        self.run(
+            section,
+            label.clone(),
+            scenario,
+            load.clone(),
+            Server::MyRedis,
+        )
+        .await?;
         if self.redis.is_some() {
             self.run(section, label, scenario, load, Server::Redis)
                 .await?;
@@ -518,7 +524,7 @@ impl Bench {
     async fn memory_section(&mut self) -> anyhow::Result<()> {
         eprintln!("memory: measuring idle footprint, connections and keys");
         self.memory
-            .push(memory_profile(&self.mini.start()?, &self.options).await?);
+            .push(memory_profile(&self.my_redis.start()?, &self.options).await?);
         if let Some(redis) = &self.redis {
             self.memory
                 .push(memory_profile(&redis.start()?, &self.options).await?);
@@ -552,9 +558,9 @@ impl Bench {
             return Ok(());
         }
         let spec = ServerSpec::new(
-            "my-mini-redis, 1 thread",
-            Kind::Mini {
-                binary: mini_binary(&self.options),
+            "my-redis, 1 thread",
+            Kind::MyRedis {
+                binary: my_redis_binary(&self.options),
                 worker_threads: Some(1),
             },
         );
@@ -585,7 +591,7 @@ impl Bench {
 
 #[derive(Clone, Copy)]
 enum Server {
-    Mini,
+    MyRedis,
     Redis,
 }
 
@@ -601,7 +607,7 @@ struct ServerSpec {
 
 enum Kind {
     /// This project's server binary, started fresh for every run.
-    Mini {
+    MyRedis {
         binary: PathBuf,
         worker_threads: Option<usize>,
     },
@@ -612,11 +618,11 @@ enum Kind {
 }
 
 /// The server binary built together with this benchmark.
-const BUILT_SERVER: &str = env!("CARGO_BIN_EXE_my-mini-redis-server");
+const BUILT_SERVER: &str = env!("CARGO_BIN_EXE_my-redis-server");
 
-/// The my-mini-redis binary to start: `--server` if given, else the one built with this
+/// The my-redis binary to start: `--server` if given, else the one built with this
 /// benchmark.
-fn mini_binary(options: &Options) -> PathBuf {
+fn my_redis_binary(options: &Options) -> PathBuf {
     options
         .server
         .clone()
@@ -634,7 +640,7 @@ impl ServerSpec {
     fn describe(&self) -> String {
         match &self.kind {
             Kind::External(address) => format!("already running at {address}"),
-            Kind::Mini { binary, .. } if binary != Path::new(BUILT_SERVER) => {
+            Kind::MyRedis { binary, .. } if binary != Path::new(BUILT_SERVER) => {
                 format!("`{}`, fresh process per run", binary.display())
             }
             _ => "fresh process per run".into(),
@@ -654,12 +660,12 @@ impl ServerSpec {
             _ => free_address()?,
         };
         let command = match &self.kind {
-            Kind::Mini {
+            Kind::MyRedis {
                 binary,
                 worker_threads,
             } => {
                 let mut command = Command::new(binary);
-                command.env("MY_MINI_REDIS_ADDRESS", &address);
+                command.env("MY_REDIS_ADDRESS", &address);
                 if let Some(threads) = worker_threads {
                     // Read by tokio's multi-threaded runtime.
                     command.env("TOKIO_WORKER_THREADS", threads.to_string());
@@ -1478,7 +1484,7 @@ impl Bench {
         let mut md = String::new();
         let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
         let o = &self.options;
-        let _ = writeln!(md, "# Load benchmark: my-mini-redis vs Redis\n");
+        let _ = writeln!(md, "# Load benchmark: my-redis vs Redis\n");
         let _ = writeln!(md, "| | |\n|---|---|");
         let _ = writeln!(
             md,
@@ -1498,7 +1504,7 @@ impl Bench {
             std::env::consts::OS,
             std::env::consts::ARCH
         );
-        let _ = writeln!(md, "| my-mini-redis | {} |", self.mini.describe());
+        let _ = writeln!(md, "| my-redis | {} |", self.my_redis.describe());
         let _ = writeln!(
             md,
             "| Redis | {} |",
@@ -1522,7 +1528,7 @@ impl Bench {
         );
         let _ = writeln!(
             md,
-            "**Reading the numbers.** Both servers and the load generator share this machine. Redis runs commands on one thread; my-mini-redis uses every core, so compare *CPU per op* for efficiency and *ops/s* for capacity. *Cores* is server CPU time divided by wall time. If the load generator's cores approach the machine's CPU count, it is the bottleneck and ops/s understates both servers. Latency for raw scenarios is per pipelined batch.\n"
+            "**Reading the numbers.** Both servers and the load generator share this machine. Redis runs commands on one thread; my-redis uses every core, so compare *CPU per op* for efficiency and *ops/s* for capacity. *Cores* is server CPU time divided by wall time. If the load generator's cores approach the machine's CPU count, it is the bottleneck and ops/s understates both servers. Latency for raw scenarios is per pipelined batch.\n"
         );
 
         self.summary_tables(&mut md);
@@ -1540,7 +1546,7 @@ impl Bench {
         let _ = writeln!(
             md,
             "## Profiling next steps\n\n\
-             - CPU profile the server under one scenario: `cargo build --release`, start `target/release/my-mini-redis-server`, run `scripts/bench.sh --address 127.0.0.1:6379 --no-redis --quick --only set --duration 30`, and attach a sampling profiler to the server (`samply record -p <pid>` on macOS, `perf record -g -p <pid>` on Linux).\n\
+             - CPU profile the server under one scenario: `cargo build --release`, start `target/release/my-redis-server`, run `scripts/bench.sh --address 127.0.0.1:6379 --no-redis --quick --only set --duration 30`, and attach a sampling profiler to the server (`samply record -p <pid>` on macOS, `perf record -g -p <pid>` on Linux).\n\
              - Compare allocation counts with a heap profiler (`heaptrack`, or Instruments' Allocations on macOS) on the same run; a high *CPU per op* with low *cores* points at per-request allocation or syscalls rather than contention.\n\
              - `JSON` with every number is next to this report for tracking changes over time.\n"
         );
@@ -1556,21 +1562,21 @@ impl Bench {
         let _ = writeln!(md, "## Summary\n");
         let _ = writeln!(
             md,
-            "| Scenario | my-mini-redis ops/s | Redis ops/s | mini / Redis | p50 mini / Redis | p99 mini / Redis | CPU per op mini / Redis | cores mini / Redis | peak RSS mini / Redis |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
+            "| Scenario | my-redis ops/s | Redis ops/s | my-redis / Redis | p50 my-redis / Redis | p99 my-redis / Redis | CPU per op my-redis / Redis | cores my-redis / Redis | peak RSS my-redis / Redis |\n|---|---:|---:|---:|---:|---:|---:|---:|---:|"
         );
         let summary: Vec<&Record> = self
             .records
             .iter()
-            .filter(|r| r.section == "summary" && r.server == self.mini.name)
+            .filter(|r| r.section == "summary" && r.server == self.my_redis.name)
             .collect();
-        for mini in &summary {
-            let other = redis.and_then(|name| self.find("summary", &mini.label, name));
-            let (a, b) = (Derived::new(mini), other.map(Derived::new));
+        for my_redis in &summary {
+            let other = redis.and_then(|name| self.find("summary", &my_redis.label, name));
+            let (a, b) = (Derived::new(my_redis), other.map(Derived::new));
             let b = b.as_ref();
             let _ = writeln!(
                 md,
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-                mini.label,
+                my_redis.label,
                 format_count(a.ops_per_sec),
                 b.map_or("-".into(), |b| format_count(b.ops_per_sec)),
                 ratio(Some(a.ops_per_sec), b.map(|b| b.ops_per_sec)),
@@ -1595,9 +1601,9 @@ impl Bench {
             md,
             "| Scenario | Server | p50 | p90 | p99 | p99.9 | max |\n|---|---|---:|---:|---:|---:|---:|"
         );
-        for mini in &summary {
-            for record in std::iter::once(*mini)
-                .chain(redis.and_then(|name| self.find("summary", &mini.label, name)))
+        for my_redis in &summary {
+            for record in std::iter::once(*my_redis)
+                .chain(redis.and_then(|name| self.find("summary", &my_redis.label, name)))
             {
                 let d = Derived::new(record);
                 let cells: Vec<String> = d
@@ -1670,13 +1676,13 @@ impl Bench {
             md,
             "Resident memory (RSS) of each server process, read from the OS after letting allocations settle. Per-connection and per-key numbers are the RSS increase divided by the count, so they include allocator overhead. Freed memory is often kept by the allocator, so RSS rarely shrinks.\n"
         );
-        let mini = self.memory.iter().find(|m| m.server == self.mini.name);
+        let my_redis = self.memory.iter().find(|m| m.server == self.my_redis.name);
         let redis = self
             .redis_name()
             .and_then(|name| self.memory.iter().find(|m| m.server == name));
         let _ = writeln!(
             md,
-            "| Measure | my-mini-redis | Redis | mini / Redis |\n|---|---:|---:|---:|"
+            "| Measure | my-redis | Redis | my-redis / Redis |\n|---|---:|---:|---:|"
         );
         let row = |md: &mut String,
                    name: &str,
@@ -1695,25 +1701,25 @@ impl Bench {
         row(
             md,
             "Idle RSS",
-            mini.and_then(|m| m.idle_kib).map(|v| v as f64 * 1024.0),
+            my_redis.and_then(|m| m.idle_kib).map(|v| v as f64 * 1024.0),
             redis.and_then(|m| m.idle_kib).map(|v| v as f64 * 1024.0),
             &bytes,
         );
-        let connections = mini.map_or(0, |m| m.connections);
+        let connections = my_redis.map_or(0, |m| m.connections);
         row(
             md,
             &format!("Per idle connection ({connections} open)"),
-            mini.and_then(|m| m.per_connection_bytes),
+            my_redis.and_then(|m| m.per_connection_bytes),
             redis.and_then(|m| m.per_connection_bytes),
             &bytes,
         );
-        for (index, (payload, keys, _)) in mini
+        for (index, (payload, keys, _)) in my_redis
             .map(|m| m.per_key.clone())
             .unwrap_or_default()
             .into_iter()
             .enumerate()
         {
-            let a = mini.and_then(|m| m.per_key[index].2);
+            let a = my_redis.and_then(|m| m.per_key[index].2);
             let b = redis.and_then(|m| m.per_key.get(index).and_then(|k| k.2));
             row(
                 md,
@@ -1738,7 +1744,7 @@ impl Bench {
                 &bytes,
             );
         }
-        for profile in [mini, redis].into_iter().flatten() {
+        for profile in [my_redis, redis].into_iter().flatten() {
             if let Some(error) = &profile.connection_error {
                 let _ = writeln!(
                     md,
@@ -1755,22 +1761,22 @@ impl Bench {
         let _ = writeln!(md, "## {title}\n");
         let _ = writeln!(
             md,
-            "| {sweep} | my-mini-redis ops/s | Redis ops/s | mini / Redis | p99 mini / Redis | CPU per op mini / Redis | cores mini / Redis | peak RSS mini / Redis |\n|---|---:|---:|---:|---:|---:|---:|---:|"
+            "| {sweep} | my-redis ops/s | Redis ops/s | my-redis / Redis | p99 my-redis / Redis | CPU per op my-redis / Redis | cores my-redis / Redis | peak RSS my-redis / Redis |\n|---|---:|---:|---:|---:|---:|---:|---:|"
         );
-        for mini in self
+        for my_redis in self
             .records
             .iter()
-            .filter(|r| r.section == sweep && r.server == self.mini.name)
+            .filter(|r| r.section == sweep && r.server == self.my_redis.name)
         {
-            let a = Derived::new(mini);
+            let a = Derived::new(my_redis);
             let b = redis
-                .and_then(|name| self.find(sweep, &mini.label, name))
+                .and_then(|name| self.find(sweep, &my_redis.label, name))
                 .map(Derived::new);
             let b = b.as_ref();
             let _ = writeln!(
                 md,
                 "| {} | {} | {} | {} | {} | {} | {} | {} |",
-                mini.label,
+                my_redis.label,
                 format_count(a.ops_per_sec),
                 b.map_or("-".into(), |b| format_count(b.ops_per_sec)),
                 ratio(Some(a.ops_per_sec), b.map(|b| b.ops_per_sec)),
@@ -1803,15 +1809,15 @@ impl Bench {
         let redis = self.redis_name();
         let _ = writeln!(
             md,
-            "## Single-threaded: my-mini-redis with 1 worker thread vs Redis\n"
+            "## Single-threaded: my-redis with 1 worker thread vs Redis\n"
         );
         let _ = writeln!(
             md,
-            "my-mini-redis started with `TOKIO_WORKER_THREADS=1`, so both servers run commands on one thread. Redis numbers are from the summary runs.\n"
+            "my-redis started with `TOKIO_WORKER_THREADS=1`, so both servers run commands on one thread. Redis numbers are from the summary runs.\n"
         );
         let _ = writeln!(
             md,
-            "| Scenario | mini (1 thread) ops/s | Redis ops/s | mini / Redis | p99 mini / Redis | CPU per op mini / Redis | cores mini / Redis |\n|---|---:|---:|---:|---:|---:|---:|"
+            "| Scenario | my-redis (1 thread) ops/s | Redis ops/s | my-redis / Redis | p99 my-redis / Redis | CPU per op my-redis / Redis | cores my-redis / Redis |\n|---|---:|---:|---:|---:|---:|---:|"
         );
         for record in single {
             let a = Derived::new(record);
@@ -1873,13 +1879,13 @@ impl Bench {
             let mut ratios: Vec<(f64, &Record, Derived)> = self
                 .records
                 .iter()
-                .filter(|r| r.section == "summary" && r.server == self.mini.name)
-                .filter_map(|mini| {
-                    let other = Derived::new(self.find("summary", &mini.label, redis)?);
-                    let a = Derived::new(mini);
+                .filter(|r| r.section == "summary" && r.server == self.my_redis.name)
+                .filter_map(|my_redis| {
+                    let other = Derived::new(self.find("summary", &my_redis.label, redis)?);
+                    let a = Derived::new(my_redis);
                     (other.ops_per_sec > 0.0).then_some((
                         a.ops_per_sec / other.ops_per_sec,
-                        mini,
+                        my_redis,
                         other,
                     ))
                 })
@@ -1900,10 +1906,10 @@ impl Bench {
             let cpu: Vec<f64> = self
                 .records
                 .iter()
-                .filter(|r| r.section == "summary" && r.server == self.mini.name)
-                .filter_map(|mini| {
-                    let a = Derived::new(mini).server_cpu_us_per_op?;
-                    let b = Derived::new(self.find("summary", &mini.label, redis)?)
+                .filter(|r| r.section == "summary" && r.server == self.my_redis.name)
+                .filter_map(|my_redis| {
+                    let a = Derived::new(my_redis).server_cpu_us_per_op?;
+                    let b = Derived::new(self.find("summary", &my_redis.label, redis)?)
                         .server_cpu_us_per_op?;
                     Some(a / b)
                 })
@@ -1911,14 +1917,14 @@ impl Bench {
             if !cpu.is_empty() {
                 let mean = cpu.iter().sum::<f64>() / cpu.len() as f64;
                 notes.push(format!(
-                    "my-mini-redis uses on average **{mean:.1}x** the CPU time per operation that Redis does across the summary scenarios; that is the efficiency gap to close independently of core count."
+                    "my-redis uses on average **{mean:.1}x** the CPU time per operation that Redis does across the summary scenarios; that is the efficiency gap to close independently of core count."
                 ));
             }
         }
-        // Multi-threaded vs single-threaded my-mini-redis on the same scenario: if one
+        // Multi-threaded vs single-threaded my-redis on the same scenario: if one
         // thread is faster or far cheaper per op, the extra threads mostly contend.
         for single in self.records.iter().filter(|r| r.section == "single-thread") {
-            if let Some(multi) = self.find("summary", &single.label, &self.mini.name) {
+            if let Some(multi) = self.find("summary", &single.label, &self.my_redis.name) {
                 let (s, m) = (Derived::new(single), Derived::new(multi));
                 if let (Some(s_cpu), Some(m_cpu), Some(m_cores)) = (
                     s.server_cpu_us_per_op,
@@ -1926,7 +1932,7 @@ impl Bench {
                     m.server_cores,
                 ) {
                     notes.push(format!(
-                        "**{}**: my-mini-redis on 1 thread does {} ops/s at {s_cpu:.2}us CPU/op; on all threads {} ops/s at {m_cpu:.2}us CPU/op using {m_cores:.1} cores. {:.1}x the CPU per op for {:.2}x the throughput points at contention between threads (the shared db lock, the scheduler) rather than command cost.",
+                        "**{}**: my-redis on 1 thread does {} ops/s at {s_cpu:.2}us CPU/op; on all threads {} ops/s at {m_cpu:.2}us CPU/op using {m_cores:.1} cores. {:.1}x the CPU per op for {:.2}x the throughput points at contention between threads (the shared db lock, the scheduler) rather than command cost.",
                         single.label,
                         format_count(s.ops_per_sec),
                         format_count(m.ops_per_sec),
@@ -1942,11 +1948,11 @@ impl Bench {
                 .and_then(|record| Derived::new(record).server_cpu_us_per_op)
         };
         if let (Some(a), Some(b)) = (
-            single_connection_cpu(&self.mini.name),
+            single_connection_cpu(&self.my_redis.name),
             self.redis_name().and_then(single_connection_cpu),
         ) {
             notes.push(format!(
-                "With a single connection (no contention), my-mini-redis needs {a:.2}us CPU per SET against Redis's {b:.2}us ({:.1}x): the per-request cost of parsing, allocating and writing replies.",
+                "With a single connection (no contention), my-redis needs {a:.2}us CPU per SET against Redis's {b:.2}us ({:.1}x): the per-request cost of parsing, allocating and writing replies.",
                 a / b
             ));
         }
@@ -1984,11 +1990,11 @@ impl Bench {
                 .and_then(|m| m.per_key.first().copied())
         };
         if let (Some((payload, _, Some(a))), Some((_, _, Some(b)))) = (
-            first_key_cost(&self.mini.name),
+            first_key_cost(&self.my_redis.name),
             self.redis_name().and_then(first_key_cost),
         ) {
             notes.push(format!(
-                "Each key with a {} value costs {} in my-mini-redis and {} in Redis ({:.1}x).",
+                "Each key with a {} value costs {} in my-redis and {} in Redis ({:.1}x).",
                 format_bytes(payload as u64),
                 format_bytes(a as u64),
                 format_bytes(b as u64),
@@ -2013,13 +2019,13 @@ impl Bench {
         let pipeline: Vec<&Record> = self
             .records
             .iter()
-            .filter(|r| r.section == "pipeline" && r.server == self.mini.name)
+            .filter(|r| r.section == "pipeline" && r.server == self.my_redis.name)
             .collect();
         if let (Some(first), Some(last)) = (pipeline.first(), pipeline.last()) {
             let (a, b) = (Derived::new(first), Derived::new(last));
             if a.ops_per_sec > 0.0 {
                 notes.push(format!(
-                    "Pipelining from {} to {} multiplies my-mini-redis throughput by {:.1}x: the larger this is, the more time goes to per-request round trips and syscalls rather than command execution.",
+                    "Pipelining from {} to {} multiplies my-redis throughput by {:.1}x: the larger this is, the more time goes to per-request round trips and syscalls rather than command execution.",
                     first.label, last.label, b.ops_per_sec / a.ops_per_sec
                 ));
             }

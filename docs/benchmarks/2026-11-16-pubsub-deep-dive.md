@@ -1,6 +1,6 @@
 # Pub/sub performance deep dive (Linux)
 
-Why my-mini-redis delivered pub/sub messages at a fraction of Redis's rate, what changed, and what is left.
+Why my-redis delivered pub/sub messages at a fraction of Redis's rate, what changed, and what is left.
 
 | | |
 |---|---|
@@ -30,15 +30,15 @@ The other scenarios didn't regress (same session, before -> after): PING 7.20M -
 
 ## Finding 1: a throughput ceiling caused by small writes
 
-Before, my-mini-redis stalled at about **3M deliveries/s whatever the fan-out** (3.10M at 10 subscribers, 3.08M at 50, 3.01M at 100), using 3.6 to 6.7 cores, while Redis reached 14M on one core. The load generator used at most 10 of 18 cores, so the server was the limit.
+Before, my-redis stalled at about **3M deliveries/s whatever the fan-out** (3.10M at 10 subscribers, 3.08M at 50, 3.01M at 100), using 3.6 to 6.7 cores, while Redis reached 14M on one core. The load generator used at most 10 of 18 cores, so the server was the limit.
 
 Syscalls per delivery, counted with `perf stat` tracepoints over 5 s at 50 subscribers:
 
 | | deliveries/s | server cores | CPU per delivery | writes per delivery | futex per delivery | context switches per delivery |
 |---|---:|---:|---:|---:|---:|---:|
-| my-mini-redis before | 3.12M | 5.6 | 1.79 us | 0.320 (`sendto`) | 0.035 | 0.016 |
-| my-mini-redis, outbox | 10.32M | 2.8 | 0.27 us | 0.039 | 0.010 | 0.005 |
-| my-mini-redis, outbox + growing reads | 11.21M | 2.6 | 0.23 us | | | |
+| my-redis before | 3.12M | 5.6 | 1.79 us | 0.320 (`sendto`) | 0.035 | 0.016 |
+| my-redis, outbox | 10.32M | 2.8 | 0.27 us | 0.039 | 0.010 | 0.005 |
+| my-redis, outbox + growing reads | 11.21M | 2.6 | 0.23 us | | | |
 | Redis | 14.18M | 1.0 | 0.07 us | 0.017 (`write`) | 0 | 0 |
 
 Before, each write carried about 3 messages, against about 60 for Redis. The CPU profile (`perf record`, frame pointers) agreed:
@@ -68,7 +68,7 @@ With the outbox in place, fewer tokio workers still meant larger writes (50 subs
 | 18 (default) | 10.23M, 0.24 us | 2.99M, 1.08 us |
 | Redis | 14.18M, 0.07 us | 6.44M, 0.16 us |
 
-At 1 KiB, my-mini-redis made 0.167 writes per delivery (about 6 messages per write), while Redis made 0.0013. Limiting threads isn't a fix, because SET and GET need the cores. The reason batches stayed small was the read buffer. `Connection` read at most 4 KiB at a time, which holds only about 4 one-KiB `PUBLISH` commands. So the publisher ran 4 commands, woke its subscribers and flushed, then read again.
+At 1 KiB, my-redis made 0.167 writes per delivery (about 6 messages per write), while Redis made 0.0013. Limiting threads isn't a fix, because SET and GET need the cores. The reason batches stayed small was the read buffer. `Connection` read at most 4 KiB at a time, which holds only about 4 one-KiB `PUBLISH` commands. So the publisher ran 4 commands, woke its subscribers and flushed, then read again.
 
 **Fix:** reads grow from 4 KiB up to 64 KiB (doubling) while each read fills the space it was given, and drop back to 4 KiB otherwise. Redis reads up to 16 KiB at a time. Idle connections keep the 4 KiB buffer. At 1 KiB and 50 subscribers this took 2.99M to 5.30M deliveries/s and 1.08 us to 0.42 us per delivery.
 
@@ -92,7 +92,7 @@ Both versions copy the bytes once per subscriber; the kernel copies again into t
 
 ## What is left
 
-At 50 subscribers my-mini-redis still needs about 3x Redis's CPU per delivery (0.23 us against 0.07 us), and its p99 latency is higher. The profile after the change:
+At 50 subscribers my-redis still needs about 3x Redis's CPU per delivery (0.23 us against 0.07 us), and its p99 latency is higher. The profile after the change:
 
 | After, 50 subscribers | inclusive share of server CPU |
 |---|---:|
@@ -104,12 +104,12 @@ At 50 subscribers my-mini-redis still needs about 3x Redis's CPU per delivery (0
 Proposed next steps, by expected gain:
 
 1. **Publishers write to subscriber sockets directly.** After its batch, a publisher would try a non-blocking write of each pending subscriber's outbox, and only wake the subscriber when the socket is full. That removes most of the remaining futex and context-switch cost and keeps each outbox on one core, as Redis's single thread does. It needs the write half of a subscribed connection shared under a lock, so replies and messages keep their order, and it adds the write syscalls to the publisher's latency. *Done: see [direct subscriber writes](2026-11-17-pubsub-direct-writes.md), which also covers a scheduling stall this exposed.*
-2. **Take pub/sub off the db lock** (its own lock, or sharded by channel). Pure pub/sub barely contends today, but the fan-out runs under the lock that every `SET` and `GET` takes. Separately, that lock serializes all commands: SET is at 0.36x Redis on 10 cores, while my-mini-redis on one thread beats Redis.
+2. **Take pub/sub off the db lock** (its own lock, or sharded by channel). Pure pub/sub barely contends today, but the fan-out runs under the lock that every `SET` and `GET` takes. Separately, that lock serializes all commands: SET is at 0.36x Redis on 10 cores, while my-redis on one thread beats Redis.
 3. **Benchmark many channels, and SET mixed with PUBLISH.** The current scenario uses one channel, so it can't show lock effects.
 4. **Share payloads instead of copying** above a size threshold (see above), if a large-payload sweep shows the copy matters.
 5. Minor: no `format!` in `encode_message`, and fewer `Vec`s per command in `Session::execute` (each under 1%).
 
-At 16 KiB payloads, Redis disconnected all 50 benchmark subscribers for going over its 32 MB output-buffer limit, so that point isn't a valid comparison. my-mini-redis has the same limit but kept all 50.
+At 16 KiB payloads, Redis disconnected all 50 benchmark subscribers for going over its 32 MB output-buffer limit, so that point isn't a valid comparison. my-redis has the same limit but kept all 50.
 
 ## Reproducing
 
@@ -117,6 +117,6 @@ At 16 KiB payloads, Redis disconnected all 50 benchmark subscribers for going ov
 docker run -d --name mmr-linux --privileged -v "$PWD":/work -v mmr-target:/work/target -w /work rust:1 sleep infinity
 docker exec mmr-linux bash -c 'apt-get update && apt-get install -y redis-server linux-perf'
 docker exec mmr-linux cargo bench --bench load -- --quick --only pubsub --subscribers 50 --duration 5
-# Syscalls per delivery: start target/release/my-mini-redis-server, run the benchmark with --address, and
+# Syscalls per delivery: start target/release/my-redis-server, run the benchmark with --address, and
 # perf stat -p <pid> -e syscalls:sys_enter_sendto,syscalls:sys_enter_futex,task-clock -- sleep 5
 ```

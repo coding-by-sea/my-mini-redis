@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 
-const CLIENT_BINARY: &str = env!("CARGO_BIN_EXE_my-mini-redis-cli");
+const CLIENT_BINARY: &str = env!("CARGO_BIN_EXE_my-redis-cli");
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_set_and_get_round_trip_through_the_server() {
@@ -313,7 +313,7 @@ async fn idempotent_subscribe() {
 fn assert_cli_output(address: &str, args: &[&str], expected_stdout: &str) {
     let output = Command::new(CLIENT_BINARY)
         .args(args)
-        .env("MY_MINI_REDIS_ADDRESS", address)
+        .env("MY_REDIS_ADDRESS", address)
         .output()
         .unwrap();
 
@@ -381,7 +381,7 @@ async fn subscribe_mode_accepts_subscribe_and_unsubscribe_commands() {
     let _ = server.await;
 }
 
-/// A `my-mini-redis-cli subscribe ...` process with piped stdin, stdout and stderr.
+/// A `my-redis-cli subscribe ...` process with piped stdin, stdout and stderr.
 struct CliSubscriber {
     child: tokio::process::Child,
     stdin: Option<tokio::process::ChildStdin>,
@@ -397,7 +397,7 @@ impl CliSubscriber {
         let mut child = tokio::process::Command::new(CLIENT_BINARY)
             .arg("subscribe")
             .args(channels)
-            .env("MY_MINI_REDIS_ADDRESS", address)
+            .env("MY_REDIS_ADDRESS", address)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

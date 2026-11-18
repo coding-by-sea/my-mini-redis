@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Load benchmark: my-mini-redis against a real Redis, under maximum load.
+# Load benchmark: my-redis against a real Redis, under maximum load.
 #
 #   scripts/bench.sh [OPTIONS]
 #
 # The benchmark starts both servers itself. Install redis-server for the comparison
-# (`brew install redis`, `apt install redis-server`); without it, only my-mini-redis
+# (`brew install redis`, `apt install redis-server`); without it, only my-redis
 # is measured. The report is printed and written to target/bench/ (latest.md, and
 # JSON for tracking over time).
 #

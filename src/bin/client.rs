@@ -5,7 +5,7 @@ use my_redis::client::Client;
 use std::env;
 
 #[derive(Debug, Parser)]
-#[command(name = "my-mini-redis", about = "A command-line client for mini-redis")]
+#[command(name = "my-redis", about = "A command-line client for my-redis")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -28,7 +28,7 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let address = env::var("MY_MINI_REDIS_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.to_owned());
+    let address = env::var("MY_REDIS_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.to_owned());
     let mut client = Client::new_with_address(&address).await?;
 
     match cli.command {
