@@ -49,7 +49,7 @@ Single runs in the same session as Redis. Scenarios that moved little were confi
 | GET via Client (1 in flight) | 614,290 | 565,812 | 1.22x | 1.16x | 4.34 / 4.73 / 2.06 us |
 | PUBLISH to 50 subscribers | 248,176 | 253,344 | 0.89x | 0.90x | 10.87 / 10.59 / 3.54 us |
 
-- **Mixed delivery latency.** Under SET load it went from p50 557 us, p99 2.56 ms and p99.9 3.57 ms to **352 us, 885 us and 1.15 ms**, on par with Redis's 590 us, 868 us and 1.02 ms. With pipelined SETs from 50 connections, my-mini-redis now outperforms Redis on both SET and PUBLISH.
+- **Mixed delivery latency.** Under SET load it went from p50 557 us, p99 2.56 ms and p99.9 3.57 ms to **352 us, 885 us and 1.15 ms**, on par with Redis's 590 us, 868 us and 1.02 ms. With pipelined SETs from 50 connections, my-redis now outperforms Redis on both SET and PUBLISH.
 - **GET via Client.** The −8% in this single run is noise. Over 4 interleaved runs each it was level: 598.5k against 597.4k requests/s, at 4.07 against 4.16 us of CPU.
 - **PUBLISH alone.** It was level over 4 interleaved runs: 246.6k against 248.1k.
 
@@ -73,4 +73,4 @@ Tests passed 10 runs out of 10 on Linux.
 ## What is left
 
 - **Merging writes across publishers** (from the earlier work): each subscriber still gets about 2x Redis's writes per delivery.
-- **CPU per operation.** It is still 2 to 4x Redis's across scenarios (SET 0.80 us against 0.33 us), now spread across cores rather than spent on one lock. my-mini-redis wins on throughput by using more cores.
+- **CPU per operation.** It is still 2 to 4x Redis's across scenarios (SET 0.80 us against 0.33 us), now spread across cores rather than spent on one lock. my-redis wins on throughput by using more cores.

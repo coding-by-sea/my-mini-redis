@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Compare my-mini-redis builds with the load benchmark, resumably.
+# Compare my-redis builds with the load benchmark, resumably.
 #
 #   scripts/compare.sh [--reps N] [--perf] <results dir> <cases file> <name>=<server binary>...
 #
 # Each line of the cases file is `<case name> <benchmark arguments>`; `#` starts a
 # comment. For every case and repetition, every build runs in turn, so drift during
-# the session affects them alike. A build is any my-mini-redis server binary, for
+# the session affects them alike. A build is any my-redis server binary, for
 # example one built from another commit:
 #
 #   git worktree add ../base main && cargo build --release --manifest-path ../base/Cargo.toml
-#   scripts/compare.sh results cases.txt base=../base/target/release/my-mini-redis-server \
-#       new=target/release/my-mini-redis-server
+#   scripts/compare.sh results cases.txt base=../base/target/release/my-redis-server \
+#       new=target/release/my-redis-server
 #   scripts/summarize.py results
 #
 # Every run keeps its raw output in <results dir>/<case>/<name>/rep<N>/: the benchmark's

@@ -1,6 +1,6 @@
 name: bench
 
-# Runs the load benchmark against my-mini-redis and a real Redis on demand.
+# Runs the load benchmark against my-redis and a real Redis on demand.
 # Shared CI runners are noisy, so compare ratios within one run rather than
 # absolute numbers across runs. The report is in the job summary and as an artifact.
 on:
@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   bench:
-    name: my-mini-redis vs Redis
+    name: my-redis vs Redis
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

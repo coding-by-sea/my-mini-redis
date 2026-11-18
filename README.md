@@ -1,4 +1,4 @@
-# my-mini-redis
+# my-redis
 
 **A high-performance Redis clone demonstrating Rust systems programming, async I/O multiplexing, and Redis-style batched pub/sub delivery.**
 
@@ -26,9 +26,9 @@ Key Techniques:
 
 ## 📊 Performance against Redis
 
-On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, my-mini-redis is ahead on most workloads by spreading them over several cores. 50 connections, pipeline 16, 64 B values unless stated:
+On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, my-redis is ahead on most workloads by spreading them over several cores. 50 connections, pipeline 16, 64 B values unless stated:
 
-| Workload | my-mini-redis | Redis 8.0.2 | mini / Redis |
+| Workload | my-redis | Redis 8.0.2 | my-redis / Redis |
 |---|---:|---:|---:|
 | SET (pipeline 16) | 6.96M ops/s | 3.00M ops/s | 2.32x |
 | GET (pipeline 16) | 7.71M ops/s | 3.44M ops/s | 2.24x |
@@ -39,7 +39,7 @@ On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, 
 | PUBLISH to 100 subscribers over 100 channels | 792k publishes/s | 623k publishes/s | 1.27x |
 | PUBLISH while 50 connections pipeline SETs | 198k publishes/s | 130k publishes/s | 1.52x |
 
-- **CPU per operation** is 1.8 to 2.8x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (1.00x to 1.08x).
+- **CPU per operation** is 1.8 to 2.8x Redis's: my-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (1.00x to 1.08x).
 - **Message delivery latency** under SET load: p99 893 us, against Redis's 868 us.
 - **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 215 B per key with 16 B values against 93 B.
 - **Run-to-run variation:** about 3%, but Redis's PUBLISH to 50 subscribers varied more (265k in this run, 282k to 286k in others), so that ratio is 0.89x to 0.95x.
@@ -172,26 +172,26 @@ Rust 1.86 or later (the crate uses edition 2024). The benchmark comparison also 
 
 ```bash
 # Start the Redis server (default port: 127.0.0.1:6379)
-cargo run --bin my-mini-redis-server
+cargo run --bin my-redis-server
 
 # Or with release optimizations
-cargo run --release --bin my-mini-redis-server
+cargo run --release --bin my-redis-server
 ```
 
 ### Using the CLI Client
 
 ```bash
 # Set a key-value pair
-cargo run --bin my-mini-redis-cli -- set greeting "Hello, Rust!"
+cargo run --bin my-redis-cli -- set greeting "Hello, Rust!"
 
 # Retrieve a value
-cargo run --bin my-mini-redis-cli -- get greeting
+cargo run --bin my-redis-cli -- get greeting
 
 # Publish to a channel
-cargo run --bin my-mini-redis-cli -- publish events "deployment_complete"
+cargo run --bin my-redis-cli -- publish events "deployment_complete"
 
 # Subscribe to multiple channels; messages print as they arrive
-cargo run --bin my-mini-redis-cli -- subscribe events logs alerts
+cargo run --bin my-redis-cli -- subscribe events logs alerts
 ```
 
 While subscribed, type commands to change the subscriptions. Leaving the last channel, or pressing Ctrl-C, exits:
@@ -206,7 +206,7 @@ There is no standalone `unsubscribe` command: subscriptions belong to a connecti
 
 ### Using the Client Library
 
-The package is named `my-redis`, so the library is imported as `my_redis`. `Client` connects to `MY_MINI_REDIS_ADDRESS`'s default, `127.0.0.1:6379` (or any address with `Client::new_with_address`):
+The package is named `my-redis`, so the library is imported as `my_redis`. `Client` connects to `MY_REDIS_ADDRESS`'s default, `127.0.0.1:6379` (or any address with `Client::new_with_address`):
 
 ```rust
 use my_redis::client::Client;
@@ -227,7 +227,7 @@ With a server running, `cargo run --example hello-redis` runs [`examples/hello-r
 
 ```bash
 # Override default server address
-export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
+export MY_REDIS_ADDRESS="127.0.0.1:6380"
 ```
 
 ### Benchmarking against Redis
@@ -239,19 +239,19 @@ scripts/bench.sh --quick        # summary and memory only
 scripts/bench.sh --help         # all options
 ```
 
-[`benches/load.rs`](benches/load.rs) starts my-mini-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
+[`benches/load.rs`](benches/load.rs) starts my-redis and `redis-server` itself, with a fresh process for every run. It loads each server as fast as it answers and writes a report to `target/bench/latest.md`, with every number also in `latest.json`. The report has these sections:
 
 - **Summary:** PING, SET, GET and PUBLISH (raw and pipelined), SET and GET through the `Client` library, pub/sub fan-out, and pipelined SET running alongside pub/sub. Each scenario has its throughput relative to Redis, p50/p90/p99/p99.9/max latency, server CPU per operation, cores used and peak memory.
 - **Memory:** idle footprint, memory per connection, and memory per key.
 - **Sweeps:** pipeline depth, number of connections, payload size, pub/sub fan-out, and the number of channels the subscribers are spread over, each varied on its own.
-- **Single-threaded:** my-mini-redis on one worker thread against Redis, which also runs commands on one thread.
+- **Single-threaded:** my-redis on one worker thread against Redis, which also runs commands on one thread.
 - **Load generator CPU and observations:** how much CPU the benchmark itself used, and notes computed from the data that point to where to optimize.
 
 You can also run it from the Actions tab (the `bench` workflow), which adds the report to the job summary.
 
 ### Comparing builds
 
-`scripts/compare.sh` runs chosen scenarios against several my-mini-redis binaries, for example `main` and a branch, with their repetitions interleaved so drift affects them alike. `scripts/summarize.py` then prints the mean per build:
+`scripts/compare.sh` runs chosen scenarios against several my-redis binaries, for example `main` and a branch, with their repetitions interleaved so drift affects them alike. `scripts/summarize.py` then prints the mean per build:
 
 ```bash
 git worktree add ../base main && cargo build --release --manifest-path ../base/Cargo.toml
@@ -261,7 +261,7 @@ set     --only set --duration 9
 mixed   --only mixed --duration 9
 CASES
 scripts/compare.sh --reps 3 results cases.txt \
-    base=../base/target/release/my-mini-redis-server new=target/release/my-mini-redis-server
+    base=../base/target/release/my-redis-server new=target/release/my-redis-server
 scripts/summarize.py results
 ```
 
@@ -271,7 +271,7 @@ Each run keeps its raw JSON and Markdown reports and a `meta.json` (arguments, b
 
 ## 🚧 Work in Progress
 
-my-mini-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`) over RESP2. The full comparison with Redis (cluster mode excluded) and the roadmap are in the **[gap analysis](https://claude.ai/artifact/NhemL1P9dvxr7bFKskRZbB#3d6c30db-642c)**.
+my-redis currently supports 8 commands (`GET`, `SET`, `PUBLISH`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PING`, `QUIT`, `RESET`) over RESP2. The full comparison with Redis (cluster mode excluded) and the roadmap are in the **[gap analysis](https://claude.ai/artifact/NhemL1P9dvxr7bFKskRZbB#3d6c30db-642c)**.
 
 ### Redis wire compatibility
 
@@ -342,7 +342,7 @@ cargo test --test redis_compat
 ## 📚 Project Structure
 
 ```
-my-mini-redis/
+my-redis/
 ├── src/
 │   ├── bin/
 │   │   ├── client.rs          # CLI client binary
