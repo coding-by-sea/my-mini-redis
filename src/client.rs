@@ -3,13 +3,12 @@ use crate::cmd::{Get, Publish, Set, Subscribe, Unsubscribe};
 use crate::connection::Connection;
 use crate::frame::Frame;
 use bytes::Bytes;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 pub struct Client {
     connection: Connection,
-    subscriptions: HashSet<String>,
     /// Messages that arrived while waiting for another reply, for `next_message`.
     pending: VecDeque<Message>,
 }
@@ -29,7 +28,6 @@ impl Client {
         let connection = TcpStream::connect(address).await?;
         Ok(Client {
             connection: Connection::new(connection),
-            subscriptions: HashSet::new(),
             pending: VecDeque::new(),
         })
     }
@@ -39,7 +37,6 @@ impl Client {
         self.connection.write_frame(set_frame).await?;
         match self.read_reply().await? {
             Frame::Simple(_) => Ok(()),
-            Frame::Error(err) => anyhow::bail!(err),
             _ => anyhow::bail!("invalid response to SET"),
         }
     }
@@ -50,7 +47,6 @@ impl Client {
         match self.read_reply().await? {
             Frame::Bulk(bytes) => Ok(Some(bytes)),
             Frame::Null => Ok(None),
-            Frame::Error(err) => anyhow::bail!(err),
             _ => anyhow::bail!("invalid response to GET"),
         }
     }
@@ -66,11 +62,11 @@ impl Client {
 
         // One acknowledgment per channel, in request order.
         for channel in channels {
-            match self.read_reply().await? {
-                Frame::Array(parts) if matches_subscribe_ack(&parts, channel) => {
-                    self.subscriptions.insert(channel.to_string());
-                }
-                Frame::Error(err) => anyhow::bail!(err),
+            match Push::from_frame(&self.read_reply().await?) {
+                Some(Push::Subscribed {
+                    channel: acknowledged,
+                    count,
+                }) if acknowledged == channel.as_bytes() && count >= 1 => {}
                 _ => anyhow::bail!("invalid response to SUBSCRIBE"),
             }
         }
@@ -100,26 +96,13 @@ impl Client {
         // One acknowledgment per subscribed channel, or a single one with a nil channel
         // if there were none. The last one reports a count of 0.
         while self.read_unsubscribe_ack().await? > 0 {}
-        self.subscriptions.clear();
         Ok(())
     }
 
     /// Reads an `[unsubscribe, channel, count]` acknowledgment and returns the count.
     async fn read_unsubscribe_ack(&mut self) -> anyhow::Result<i64> {
-        match self.read_reply().await? {
-            Frame::Array(parts) => match parts.as_slice() {
-                [Frame::Bulk(kind), channel, Frame::Integer(count)]
-                    if kind.as_ref() == b"unsubscribe" =>
-                {
-                    if let Frame::Bulk(channel) = channel {
-                        self.subscriptions
-                            .remove(String::from_utf8_lossy(channel).as_ref());
-                    }
-                    Ok(*count)
-                }
-                _ => anyhow::bail!("invalid response to UNSUBSCRIBE"),
-            },
-            Frame::Error(err) => anyhow::bail!(err),
+        match Push::from_frame(&self.read_reply().await?) {
+            Some(Push::Unsubscribed { count, .. }) => Ok(count),
             _ => anyhow::bail!("invalid response to UNSUBSCRIBE"),
         }
     }
@@ -128,15 +111,12 @@ impl Client {
         if let Some(message) = self.pending.pop_front() {
             return Ok(Some(message));
         }
-        match self.connection.read_frame().await? {
-            Some(frame) => match parse_message(&frame) {
-                Some(message) => Ok(Some(message)),
-                None => match frame {
-                    Frame::Error(err) => anyhow::bail!(err),
-                    _ => anyhow::bail!("invalid subscription message"),
-                },
-            },
-            None => Ok(None),
+        let Some(frame) = self.connection.read_frame().await? else {
+            return Ok(None);
+        };
+        match Push::from_frame(&error_to_err(frame)?) {
+            Some(Push::Message(message)) => Ok(Some(message)),
+            _ => anyhow::bail!("invalid subscription message"),
         }
     }
 
@@ -145,21 +125,21 @@ impl Client {
         self.connection.write_frame(publish_frame).await?;
         match self.read_reply().await? {
             Frame::Integer(count) if count >= 0 => Ok(count as u64),
-            Frame::Error(err) => anyhow::bail!(err),
             _ => anyhow::bail!("invalid response to PUBLISH"),
         }
     }
 
-    /// Reads the reply to a command. Published messages can arrive first on a
-    /// subscribed connection; they are kept for `next_message`.
+    /// Reads the reply to a command; an error reply is returned as an `Err`.
+    /// Published messages can arrive first on a subscribed connection; they are kept
+    /// for `next_message`.
     async fn read_reply(&mut self) -> anyhow::Result<Frame> {
         loop {
             let Some(frame) = self.connection.read_frame().await? else {
                 anyhow::bail!("connection closed by server");
             };
-            match parse_message(&frame) {
-                Some(message) => self.pending.push_back(message),
-                None => return Ok(frame),
+            match Push::from_frame(&frame) {
+                Some(Push::Message(message)) => self.pending.push_back(message),
+                _ => return error_to_err(frame),
             }
         }
     }
@@ -231,11 +211,9 @@ impl Client {
 
         match command.to_ascii_lowercase().as_str() {
             "subscribe" if !channels.is_empty() => {
-                for channel in channels {
-                    self.connection
-                        .write_frame(Subscribe::new(channel).into_frame())
-                        .await?;
-                }
+                self.connection
+                    .write_frame(Subscribe::new_multiple(channels).into_frame())
+                    .await?;
             }
             "subscribe" => eprintln!("usage: subscribe <channel> [channel...]"),
             "unsubscribe" => {
@@ -250,50 +228,80 @@ impl Client {
 
     /// Returns true once no subscriptions remain.
     fn handle_subscribe_mode_frame(&mut self, frame: Frame) -> anyhow::Result<bool> {
-        let parts = match frame {
-            Frame::Array(parts) => parts,
-            Frame::Error(err) => anyhow::bail!(err),
-            _ => anyhow::bail!("invalid subscription message"),
-        };
+        match Push::from_frame(&error_to_err(frame)?) {
+            Some(Push::Message(message)) => {
+                print_message(&message);
+                Ok(false)
+            }
+            Some(Push::Subscribed { channel, .. }) => {
+                println!("subscribed to {}", String::from_utf8_lossy(&channel));
+                Ok(false)
+            }
+            Some(Push::Unsubscribed { channel, count }) => {
+                // The channel is nil for a bare UNSUBSCRIBE with no subscriptions left.
+                if let Some(channel) = channel {
+                    println!("unsubscribed from {}", String::from_utf8_lossy(&channel));
+                }
+                Ok(count == 0)
+            }
+            None => anyhow::bail!("invalid subscription message"),
+        }
+    }
+}
 
-        match parts.as_slice() {
-            [
-                Frame::Bulk(kind),
-                Frame::Bulk(channel),
-                Frame::Bulk(payload),
-            ] if kind.as_ref() == b"message" => {
-                print_message(&Message {
+/// A pub/sub push from the server.
+enum Push {
+    /// `[message, channel, payload]`: a published message.
+    Message(Message),
+    /// `[subscribe, channel, count]`: count is the subscriptions after this one.
+    Subscribed { channel: Bytes, count: i64 },
+    /// `[unsubscribe, channel, count]`: the channel is `None` (nil) when there was
+    /// nothing to unsubscribe from.
+    Unsubscribed { channel: Option<Bytes>, count: i64 },
+}
+
+impl Push {
+    /// Returns `None` for any frame that isn't a pub/sub push.
+    fn from_frame(frame: &Frame) -> Option<Push> {
+        let Frame::Array(parts) = frame else {
+            return None;
+        };
+        let [Frame::Bulk(kind), channel, last] = parts.as_slice() else {
+            return None;
+        };
+        match (kind.as_ref(), channel, last) {
+            (b"message", Frame::Bulk(channel), Frame::Bulk(payload)) => {
+                Some(Push::Message(Message {
                     channel: String::from_utf8_lossy(channel).into_owned(),
                     payload: payload.clone(),
-                });
-                Ok(false)
+                }))
             }
-            [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(_)]
-                if kind.as_ref() == b"subscribe" =>
-            {
-                let channel = String::from_utf8(channel.to_vec())?;
-                println!("subscribed to {}", channel);
-                self.subscriptions.insert(channel);
-                Ok(false)
+            (b"subscribe", Frame::Bulk(channel), &Frame::Integer(count)) => {
+                Some(Push::Subscribed {
+                    channel: channel.clone(),
+                    count,
+                })
             }
-            [
-                Frame::Bulk(kind),
-                Frame::Bulk(channel),
-                Frame::Integer(count),
-            ] if kind.as_ref() == b"unsubscribe" => {
-                let channel = String::from_utf8_lossy(channel);
-                println!("unsubscribed from {}", channel);
-                self.subscriptions.remove(channel.as_ref());
-                Ok(*count == 0)
+            (b"unsubscribe", Frame::Bulk(channel), &Frame::Integer(count)) => {
+                Some(Push::Unsubscribed {
+                    channel: Some(channel.clone()),
+                    count,
+                })
             }
-            // A bare UNSUBSCRIBE with no subscriptions left.
-            [Frame::Bulk(kind), Frame::Null, Frame::Integer(_)]
-                if kind.as_ref() == b"unsubscribe" =>
-            {
-                Ok(true)
-            }
-            _ => anyhow::bail!("invalid subscription message"),
+            (b"unsubscribe", Frame::Null, &Frame::Integer(count)) => Some(Push::Unsubscribed {
+                channel: None,
+                count,
+            }),
+            _ => None,
         }
+    }
+}
+
+/// Turns an error reply into an `Err` carrying the server's message.
+fn error_to_err(frame: Frame) -> anyhow::Result<Frame> {
+    match frame {
+        Frame::Error(message) => Err(anyhow::Error::msg(message)),
+        frame => Ok(frame),
     }
 }
 
@@ -305,30 +313,57 @@ fn print_message(message: &Message) {
     );
 }
 
-/// Returns the message if `frame` is a published `[message, channel, payload]`.
-fn parse_message(frame: &Frame) -> Option<Message> {
-    match frame {
-        Frame::Array(parts) => match parts.as_slice() {
-            [
-                Frame::Bulk(kind),
-                Frame::Bulk(channel),
-                Frame::Bulk(payload),
-            ] if kind.as_ref() == b"message" => Some(Message {
-                channel: String::from_utf8_lossy(channel).into_owned(),
-                payload: payload.clone(),
-            }),
-            _ => None,
-        },
-        _ => None,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{Message, Push};
+    use crate::frame::Frame;
+    use bytes::Bytes;
 
-fn matches_subscribe_ack(parts: &[Frame], expected_channel: &str) -> bool {
-    matches!(
-        parts,
-        [Frame::Bulk(kind), Frame::Bulk(channel), Frame::Integer(count)]
-            if kind.as_ref() == b"subscribe"
-                && channel.as_ref() == expected_channel.as_bytes()
-                && *count >= 1
-    )
+    fn bulk(text: &'static str) -> Frame {
+        Frame::Bulk(Bytes::from_static(text.as_bytes()))
+    }
+
+    #[test]
+    fn classifies_pub_sub_pushes() {
+        let message = Frame::Array(vec![bulk("message"), bulk("news"), bulk("hi")]);
+        assert!(matches!(
+            Push::from_frame(&message),
+            Some(Push::Message(Message { channel, payload })) if channel == "news" && payload == "hi"
+        ));
+
+        let subscribed = Frame::Array(vec![bulk("subscribe"), bulk("news"), Frame::Integer(1)]);
+        assert!(matches!(
+            Push::from_frame(&subscribed),
+            Some(Push::Subscribed { channel, count: 1 }) if channel == "news"
+        ));
+
+        let unsubscribed = Frame::Array(vec![bulk("unsubscribe"), bulk("news"), Frame::Integer(0)]);
+        assert!(matches!(
+            Push::from_frame(&unsubscribed),
+            Some(Push::Unsubscribed { channel: Some(channel), count: 0 }) if channel == "news"
+        ));
+
+        let nothing_to_leave =
+            Frame::Array(vec![bulk("unsubscribe"), Frame::Null, Frame::Integer(0)]);
+        assert!(matches!(
+            Push::from_frame(&nothing_to_leave),
+            Some(Push::Unsubscribed {
+                channel: None,
+                count: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn other_frames_are_not_pushes() {
+        for frame in [
+            Frame::Simple("OK".into()),
+            Frame::Array(vec![bulk("message"), bulk("news")]),
+            Frame::Array(vec![bulk("message"), bulk("news"), Frame::Integer(1)]),
+            Frame::Array(vec![bulk("subscribe"), Frame::Null, Frame::Integer(1)]),
+            Frame::Array(vec![bulk("pong"), bulk(""), bulk("")]),
+        ] {
+            assert!(Push::from_frame(&frame).is_none(), "{frame:?}");
+        }
+    }
 }

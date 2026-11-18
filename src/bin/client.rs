@@ -29,30 +29,18 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let address = env::var("MY_MINI_REDIS_ADDRESS").unwrap_or_else(|_| DEFAULT_ADDRESS.to_owned());
-    let mut client = Client::new_with_address(&address)
-        .await
-        .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+    let mut client = Client::new_with_address(&address).await?;
 
     match cli.command {
-        Command::Get { key } => match client
-            .get(&key)
-            .await
-            .map_err(|error| anyhow::Error::msg(error.to_string()))?
-        {
+        Command::Get { key } => match client.get(&key).await? {
             Some(value) => println!("{}", String::from_utf8_lossy(&value)),
             None => println!("(nil)"),
         },
         Command::Set { key, value } => {
-            client
-                .set(&key, Bytes::from(value))
-                .await
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            client.set(&key, Bytes::from(value)).await?;
         }
         Command::Publish { channel, message } => {
-            let recipients = client
-                .publish(&channel, Bytes::from(message))
-                .await
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            let recipients = client.publish(&channel, Bytes::from(message)).await?;
             println!("{}", recipients);
         }
         Command::Subscribe { channels } => {
@@ -60,10 +48,7 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("at least one channel is required");
             }
             let channel_refs: Vec<&str> = channels.iter().map(|s| s.as_str()).collect();
-            client
-                .subscribe_multiple(&channel_refs)
-                .await
-                .map_err(|error| anyhow::Error::msg(error.to_string()))?;
+            client.subscribe_multiple(&channel_refs).await?;
             client.enter_subscribe_mode().await?;
         }
     }
