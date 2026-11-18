@@ -30,20 +30,21 @@ On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, 
 
 | Workload | my-mini-redis | Redis 8.0.2 | mini / Redis |
 |---|---:|---:|---:|
-| SET (pipeline 16) | 7.00M ops/s | 3.04M ops/s | 2.30x |
-| GET (pipeline 16) | 7.65M ops/s | 3.45M ops/s | 2.22x |
-| PING (pipeline 16) | 8.89M ops/s | 4.85M ops/s | 1.83x |
-| SET, pipeline 64 | 14.67M ops/s | 3.88M ops/s | 3.79x |
-| SET, 1 request in flight per connection | 596k ops/s | 488k ops/s | 1.22x |
-| PUBLISH to 50 subscribers on one channel | 252k publishes/s | 284k publishes/s | 0.89x |
-| PUBLISH to 100 subscribers over 100 channels | 801k publishes/s | 605k publishes/s | 1.32x |
-| PUBLISH while 50 connections pipeline SETs | 196k publishes/s | 128k publishes/s | 1.53x |
+| SET (pipeline 16) | 6.96M ops/s | 3.00M ops/s | 2.32x |
+| GET (pipeline 16) | 7.71M ops/s | 3.44M ops/s | 2.24x |
+| PING (pipeline 16) | 9.16M ops/s | 4.84M ops/s | 1.89x |
+| SET, pipeline 64 | 14.80M ops/s | 4.03M ops/s | 3.68x |
+| SET, 1 request in flight per connection | 598k ops/s | 478k ops/s | 1.25x |
+| PUBLISH to 50 subscribers on one channel | 252k publishes/s | 265k publishes/s | 0.95x |
+| PUBLISH to 100 subscribers over 100 channels | 792k publishes/s | 623k publishes/s | 1.27x |
+| PUBLISH while 50 connections pipeline SETs | 198k publishes/s | 130k publishes/s | 1.52x |
 
-- **CPU per operation** is 1.9 to 3.0x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (0.96x to 1.04x).
-- **Message delivery latency** under SET load: p99 885 us, against Redis's 975 us.
-- **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 212 B per key with 16 B values against 93 B.
+- **CPU per operation** is 1.8 to 2.8x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (1.00x to 1.08x).
+- **Message delivery latency** under SET load: p99 893 us, against Redis's 868 us.
+- **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 215 B per key with 16 B values against 93 B.
+- **Run-to-run variation:** about 3%, but Redis's PUBLISH to 50 subscribers varied more (265k in this run, 282k to 286k in others), so that ratio is 0.89x to 0.95x.
 
-Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchmarks/2026-11-17-full-linux.md](docs/benchmarks/2026-11-17-full-linux.md). The load generator runs on the same machine, so absolute numbers depend on it; the ratios are the comparison.
+Measured with `scripts/bench.sh` at commit `09ce574`; full report: [docs/benchmarks/2026-11-18-full-linux.md](docs/benchmarks/2026-11-18-full-linux.md). The load generator runs on the same machine, so absolute numbers depend on it; the ratios are the comparison.
 
 ---
 
@@ -64,7 +65,7 @@ Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchma
 │  │           Connection Handler (per-connection task)        │  │
 │  │                                                           │  │
 │  │   tokio::select! {                                        │  │
-│  │     reader.read_request()  ─▶ Session::execute()          │  │
+│  │     reader.read_request()  ─▶ Session::serve_batch()      │  │
 │  │     outbox.ready()         ─▶ finish a write the socket   │  │
 │  │                               blocked, or disconnect      │  │
 │  │                               (>32 MB queued)             │  │
@@ -112,7 +113,12 @@ Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchma
 
 ```rust
 // src/subscription.rs
-pub(crate) fn publish(registry: &Registry, channel: &Bytes, payload: &Bytes, wakes: &mut Wakes) -> usize {
+pub(crate) fn publish(
+    registry: &Registry,
+    channel: &Bytes,
+    payload: &Bytes,
+    wakes: &mut Wakes,
+) -> usize {
     let Some(subscribers) = registry.get(channel) else {
         return 0;
     };
@@ -138,7 +144,7 @@ tokio::select! {
 }
 ```
 
-Every branch is cancel safe: `read_request` only awaits socket readiness, and `ready` waits on a `Notify`, which keeps a signal sent while nobody waits. Queued bytes can't be stranded: the writer token is only released with the outbox empty, checked under its lock.
+Every branch is cancel safe: `read_request` only awaits `read_buf`, and `ready` waits on a `Notify`, which keeps a signal sent while nobody waits. Queued bytes can't be stranded: the writer token is only released with the outbox empty, checked under its lock.
 
 ### 3. **Redis-compatible errors**
 
@@ -228,7 +234,7 @@ export MY_MINI_REDIS_ADDRESS="127.0.0.1:6380"
 
 ```bash
 brew install redis              # or: apt install redis-server (needed for the comparison)
-scripts/bench.sh                # full run, about 4 minutes
+scripts/bench.sh                # full run, about 5 minutes
 scripts/bench.sh --quick        # summary and memory only
 scripts/bench.sh --help         # all options
 ```
@@ -318,7 +324,7 @@ cargo test --test redis_compat
 
 ### Test Coverage
 
-- **32 Unit Tests**: RESP frame encoding/decoding, client connection reads and writes, pub/sub push classification in the client, request parsing (RESP and inline), 3 pub/sub channel-cleanup tests, and 2 stress tests checking that frames stay whole and ordered with concurrent writers per socket
+- **32 Unit Tests**: RESP frame encoding and decoding, client connection reads and writes, pub/sub push classification in the client, request parsing (RESP and inline, including requests split across reads), 3 pub/sub channel-cleanup tests, and 2 stress tests checking that frames stay whole and ordered with concurrent writers per socket
 - **21 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, client error handling, and CLI subscribe mode driven through stdin
 - **35 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, run against Redis 7.2.5 in CI
 - **4 CLI Parsing Tests**: Clap argument validation
@@ -351,7 +357,7 @@ my-mini-redis/
 │   ├── client.rs              # Client library API
 │   ├── server.rs              # Server connection handler
 │   ├── connection.rs          # Client connection (RESP framing) and the server's request reader
-│   ├── frame.rs               # RESP frames (encoded by the server, parsed by the client)
+│   ├── frame.rs               # RESP frames (encoded by both sides, parsed by the client)
 │   ├── outbox.rs              # Per-connection output FIFO and single-writer token
 │   ├── request.rs             # Request parsing (RESP arrays and inline commands)
 │   ├── subscription.rs        # Channel registry, fan-out and batched subscriber writes
