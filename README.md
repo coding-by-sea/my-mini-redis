@@ -30,20 +30,21 @@ On Linux (18 CPUs), with Redis 8.0.2 running the same load in the same session, 
 
 | Workload | my-mini-redis | Redis 8.0.2 | mini / Redis |
 |---|---:|---:|---:|
-| SET (pipeline 16) | 7.00M ops/s | 3.04M ops/s | 2.30x |
-| GET (pipeline 16) | 7.65M ops/s | 3.45M ops/s | 2.22x |
-| PING (pipeline 16) | 8.89M ops/s | 4.85M ops/s | 1.83x |
-| SET, pipeline 64 | 14.67M ops/s | 3.88M ops/s | 3.79x |
-| SET, 1 request in flight per connection | 596k ops/s | 488k ops/s | 1.22x |
-| PUBLISH to 50 subscribers on one channel | 252k publishes/s | 284k publishes/s | 0.89x |
-| PUBLISH to 100 subscribers over 100 channels | 801k publishes/s | 605k publishes/s | 1.32x |
-| PUBLISH while 50 connections pipeline SETs | 196k publishes/s | 128k publishes/s | 1.53x |
+| SET (pipeline 16) | 6.96M ops/s | 3.00M ops/s | 2.32x |
+| GET (pipeline 16) | 7.71M ops/s | 3.44M ops/s | 2.24x |
+| PING (pipeline 16) | 9.16M ops/s | 4.84M ops/s | 1.89x |
+| SET, pipeline 64 | 14.80M ops/s | 4.03M ops/s | 3.68x |
+| SET, 1 request in flight per connection | 598k ops/s | 478k ops/s | 1.25x |
+| PUBLISH to 50 subscribers on one channel | 252k publishes/s | 265k publishes/s | 0.95x |
+| PUBLISH to 100 subscribers over 100 channels | 792k publishes/s | 623k publishes/s | 1.27x |
+| PUBLISH while 50 connections pipeline SETs | 198k publishes/s | 130k publishes/s | 1.52x |
 
-- **CPU per operation** is 1.9 to 3.0x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (0.96x to 1.04x).
-- **Message delivery latency** under SET load: p99 885 us, against Redis's 975 us.
-- **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 212 B per key with 16 B values against 93 B.
+- **CPU per operation** is 1.8 to 2.8x Redis's: my-mini-redis wins on throughput by using more cores. Restricted to one thread, it matches Redis (1.00x to 1.08x).
+- **Message delivery latency** under SET load: p99 893 us, against Redis's 868 us.
+- **Memory:** 2.7 MiB idle against Redis's 18.1 MiB, but 215 B per key with 16 B values against 93 B.
+- **Run-to-run variation:** about 3%, but Redis's PUBLISH to 50 subscribers varied more (265k in this run, 282k to 286k in others), so that ratio is 0.89x to 0.95x.
 
-Measured with `scripts/bench.sh` at commit `f6ecede`; full report: [docs/benchmarks/2026-11-17-full-linux.md](docs/benchmarks/2026-11-17-full-linux.md). The load generator runs on the same machine, so absolute numbers depend on it; the ratios are the comparison.
+Measured with `scripts/bench.sh` at commit `09ce574`; full report: [docs/benchmarks/2026-11-18-full-linux.md](docs/benchmarks/2026-11-18-full-linux.md). The load generator runs on the same machine, so absolute numbers depend on it; the ratios are the comparison.
 
 ---
 
