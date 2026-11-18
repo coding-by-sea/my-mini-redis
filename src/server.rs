@@ -224,7 +224,7 @@ impl Session {
             Ok(command) => command,
             Err(message) => return self.reply(error_frame(message), Next::Continue),
         };
-        trace!(command = command.name());
+        trace!(command = command.name(), "command");
         if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
             let error = error_frame(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",
