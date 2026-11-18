@@ -228,6 +228,10 @@ With a server running, `cargo run --example hello-redis` runs [`examples/hello-r
 ```bash
 # Override default server address
 export MY_REDIS_ADDRESS="127.0.0.1:6380"
+
+# Server logging, to stderr: info (default) logs startup and errors, debug adds
+# connections opening and closing, trace adds every command
+RUST_LOG=debug cargo run --release --bin my-redis-server
 ```
 
 ### Benchmarking against Redis
