@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -19,7 +20,10 @@ pub const DEFAULT_ADDRESS: &str = "127.0.0.1:6379";
 /// and the other way around.
 #[derive(Default)]
 struct Shared {
-    entries: Mutex<HashMap<Bytes, Bytes>>,
+    /// Sharded, each shard with its own read-write lock: with one lock for all keys,
+    /// pipelined SETs from 50 connections spent about 60% of the server's CPU waking
+    /// each other up on unlock (`futex_wake`), and under 1% inserting.
+    entries: DashMap<Bytes, Bytes>,
     /// One lock for all of pub/sub, so publishes are totally ordered: every subscriber
     /// sees them in the same order, as in Redis.
     registry: Mutex<Registry>,

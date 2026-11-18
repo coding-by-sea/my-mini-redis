@@ -50,7 +50,7 @@ Key Technics:
 │                                      │ lock                     │
 │  ┌───────────────────────────────────▼───────────────────────┐  │
 │  │                 Shared State (Arc<Shared>)                │  │
-│  │   entries:  Mutex<HashMap<Bytes, Bytes>>                  │  │
+│  │   entries:  DashMap<Bytes, Bytes>   (sharded)             │  │
 │  │   registry: Mutex<HashMap<channel, HashMap<id, Outbox>>>  │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
@@ -71,7 +71,7 @@ Key Technics:
 
 4. **One writer per socket at a time**: several connections can now write to one socket, so a writer token keeps Redis's rule that a socket has a single writer. Only the token holder writes, from the head of the outbox; everyone else only appends, and the holder sends what they appended before releasing the token. Writers other than the connection's own task never wait: when the socket is full, they hand the token to that task.
 
-5. **Separate locks for keys and pub/sub**: `GET` and `SET` take the keys' lock; `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` take the pub/sub registry's. A fan-out to many subscribers therefore doesn't hold up key commands, and a burst of `SET`s doesn't starve publishers. Pub/sub keeps one lock rather than one per channel, so every subscriber sees publishes in the same order.
+5. **Sharded keys, and a separate lock for pub/sub**: keys live in a `DashMap`, whose shards each have their own read-write lock, so `GET` and `SET` on different keys rarely contend. With one lock over all keys, pipelined `SET`s from 50 connections spent about 60% of the server's CPU waking each other on unlock. `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` take the pub/sub registry's lock, so a fan-out to many subscribers doesn't hold up key commands, and a burst of `SET`s doesn't starve publishers. Pub/sub keeps one lock rather than one per channel, so every subscriber sees publishes in the same order.
 
 6. **One batch per client at a time**: a connection yields to the scheduler after each batch of pipelined requests, as Redis's event loop serves each client once per pass. Without this, a client whose next batch had already arrived was served batch after batch in one task poll, and other clients' requests waited: publishers stalled for up to seconds, and `PUBLISH` ran at a fifth of its rate next to pipelined `SET`s. A lone request that wrote to nobody else skips the yield, since its client is waiting for the reply anyway.
 
@@ -259,7 +259,7 @@ cargo test --test redis_compat
 ### Memory Safety Guarantees
 
 - **No `unsafe` blocks**: 100% safe Rust (verified with `rg "unsafe"`)
-- **No data races**: All shared state guarded by `Arc<Mutex<T>>`, atomics or Tokio sync primitives
+- **No data races**: All shared state guarded by `Mutex`, `DashMap`'s sharded locks, atomics or Tokio sync primitives
 - **No use-after-free**: Ownership system enforces lifetime validity at compile time
 - **Connection cleanup by RAII**: when a connection's task ends, including by panic, its `Session` is dropped, which removes its subscriptions; its socket closes once the last outbox reference is gone
 
