@@ -1300,3 +1300,46 @@ async fn pipelined_replies_are_not_delayed() {
     );
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// 1.18 A publish reaches every subscriber of a crowded channel
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn publish_reaches_every_subscriber_of_a_crowded_channel() {
+    let (address, server) = start_server().await;
+
+    // More than the server writes inline per publish (512): the rest are sent by their
+    // own connection's task, which the publisher only wakes.
+    const SUBSCRIBERS: usize = 600;
+    let mut subscribers = Vec::with_capacity(SUBSCRIBERS);
+    for _ in 0..SUBSCRIBERS {
+        let mut subscriber = RawClient::connect(&address).await;
+        assert_eq!(
+            subscriber.cmd(&[b"SUBSCRIBE", b"crowd"]).await,
+            push("subscribe", "crowd", Reply::Integer(1))
+        );
+        subscribers.push(subscriber);
+    }
+
+    let mut publisher = RawClient::connect(&address).await;
+    for payload in ["first", "second"] {
+        assert_eq!(
+            publisher
+                .cmd(&[b"PUBLISH", b"crowd", payload.as_bytes()])
+                .await,
+            Reply::Integer(SUBSCRIBERS as i64)
+        );
+    }
+
+    for (index, subscriber) in subscribers.iter_mut().enumerate() {
+        for payload in ["first", "second"] {
+            assert_eq!(
+                subscriber.read().await,
+                push("message", "crowd", bulk(payload)),
+                "subscriber {index}"
+            );
+        }
+    }
+    server.abort();
+}

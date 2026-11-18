@@ -312,6 +312,23 @@ mod tests {
         assert_frame_eq(&Frame::read_frame(&mut cursor).unwrap(), &Frame::Null);
     }
 
+    #[test]
+    fn rejects_unknown_type_bytes_and_negative_lengths_other_than_minus_one() {
+        let mut cursor = Cursor::new(b"?OK\r\n".as_slice());
+        assert!(matches!(
+            Frame::check(&mut cursor),
+            Err(Error::InvalidEncoding)
+        ));
+
+        for input in [b"?OK\r\n".as_slice(), b"$-2\r\n", b"*-2\r\n"] {
+            let mut cursor = Cursor::new(input);
+            assert!(
+                matches!(Frame::read_frame(&mut cursor), Err(Error::InvalidEncoding)),
+                "{input:?}"
+            );
+        }
+    }
+
     fn assert_frame_eq(actual: &Frame, expected: &Frame) {
         match (actual, expected) {
             (Frame::Simple(actual), Frame::Simple(expected))

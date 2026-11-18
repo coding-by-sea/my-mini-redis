@@ -319,6 +319,10 @@ mod tests {
             parse(b"SET k a\"b c\"\n"),
             request(&["SET", "k", "ab c"], 13)
         );
+        assert_eq!(
+            parse(b"SET k \"\\r\\b\\a\\q\\x4a\\x4A\"\n"),
+            request(&["SET", "k", "\r\x08\x07qJJ"], 25)
+        );
     }
 
     #[test]
@@ -327,6 +331,7 @@ mod tests {
         assert_eq!(parse(b"SET k \"abc\"def\r\n"), unbalanced);
         assert_eq!(parse(b"SET k \"unterminated\r\n"), unbalanced);
         assert_eq!(parse(b"SET k 'unterminated\n"), unbalanced);
+        assert_eq!(parse(b"SET k 'abc'def\n"), unbalanced);
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::process::Command;
 use bytes::Bytes;
 use my_redis::client::Client;
 use my_redis::server::Server;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 
@@ -729,4 +730,178 @@ async fn cli_subscribe_mode_handles_commands_while_a_channel_is_busy() {
     flood.abort();
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test]
+async fn messages_that_arrive_before_a_reply_are_kept_for_next_message() {
+    let (address, server) = start_server().await;
+    let mut subscriber = Client::new_with_address(&address).await.unwrap();
+    let mut publisher = Client::new_with_address(&address).await.unwrap();
+    subscriber.subscribe("first").await.unwrap();
+
+    // The message is on the subscriber's socket before PUBLISH is answered, so the
+    // next SUBSCRIBE reads it ahead of its own acknowledgment.
+    assert_eq!(
+        publisher
+            .publish("first", Bytes::from("early"))
+            .await
+            .unwrap(),
+        1
+    );
+    subscriber.subscribe("second").await.unwrap();
+    assert_eq!(
+        publisher
+            .publish("second", Bytes::from("later"))
+            .await
+            .unwrap(),
+        1
+    );
+
+    for (channel, payload) in [("first", "early"), ("second", "later")] {
+        let message = timeout(Duration::from_secs(1), subscriber.next_message())
+            .await
+            .expect("message not delivered")
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.channel, channel);
+        assert_eq!(message.payload, Bytes::from(payload));
+    }
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn unsubscribe_with_no_channels_leaves_every_channel() {
+    let (address, server) = start_server().await;
+    let mut subscriber = Client::new_with_address(&address).await.unwrap();
+    let mut publisher = Client::new_with_address(&address).await.unwrap();
+    subscriber
+        .subscribe_multiple(&["events", "logs"])
+        .await
+        .unwrap();
+
+    subscriber.unsubscribe(&[]).await.unwrap();
+
+    assert_eq!(
+        publisher.publish("events", Bytes::from("e")).await.unwrap(),
+        0
+    );
+    assert_eq!(
+        publisher.publish("logs", Bytes::from("l")).await.unwrap(),
+        0
+    );
+
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn error_replies_are_returned_as_errors() {
+    let mut client = scripted_client(b"-ERR boom\r\n").await;
+    assert_eq!(
+        client
+            .set("k", Bytes::from("v"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "ERR boom"
+    );
+
+    let mut client = scripted_client(b"-ERR boom\r\n").await;
+    assert_eq!(client.get("k").await.unwrap_err().to_string(), "ERR boom");
+
+    let mut client = scripted_client(b"-ERR boom\r\n").await;
+    assert_eq!(
+        client
+            .publish("c", Bytes::from("m"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "ERR boom"
+    );
+
+    let mut client = scripted_client(b"-ERR boom\r\n").await;
+    assert_eq!(
+        client.subscribe("c").await.unwrap_err().to_string(),
+        "ERR boom"
+    );
+
+    let mut client = scripted_client(b"-ERR boom\r\n").await;
+    assert_eq!(
+        client.next_message().await.unwrap_err().to_string(),
+        "ERR boom"
+    );
+}
+
+#[tokio::test]
+async fn replies_of_the_wrong_type_are_errors() {
+    let mut client = scripted_client(b":1\r\n").await;
+    assert_eq!(
+        client.get("k").await.unwrap_err().to_string(),
+        "invalid response to GET"
+    );
+
+    let mut client = scripted_client(b"$2\r\nOK\r\n").await;
+    assert_eq!(
+        client
+            .set("k", Bytes::from("v"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "invalid response to SET"
+    );
+
+    let mut client = scripted_client(b":-1\r\n").await;
+    assert_eq!(
+        client
+            .publish("c", Bytes::from("m"))
+            .await
+            .unwrap_err()
+            .to_string(),
+        "invalid response to PUBLISH"
+    );
+
+    let mut client = scripted_client(b":0\r\n").await;
+    assert_eq!(
+        client.unsubscribe(&["c"]).await.unwrap_err().to_string(),
+        "invalid response to UNSUBSCRIBE"
+    );
+}
+
+#[tokio::test]
+async fn closed_connection_ends_messages_but_fails_commands() {
+    let mut client = scripted_client(b"").await;
+    assert!(client.next_message().await.unwrap().is_none());
+
+    let mut client = scripted_client(b"").await;
+    assert_eq!(
+        client.get("k").await.unwrap_err().to_string(),
+        "connection closed by server"
+    );
+}
+
+#[tokio::test]
+async fn message_cut_off_mid_frame_is_an_error_not_a_clean_close() {
+    // A clean close ends the subscription with `Ok(None)`; losing the connection
+    // partway through a message must not look the same.
+    let mut client = scripted_client(b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$5\r\nhel").await;
+    let result = client.next_message().await;
+    assert!(result.is_err(), "truncated message returned {result:?}");
+}
+
+/// A client connected to a server that sends `reply` whatever it receives, then
+/// closes its side.
+async fn scripted_client(reply: &'static [u8]) -> Client {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        socket.write_all(reply).await.unwrap();
+        socket.shutdown().await.unwrap();
+        // Read until the client hangs up: closing with its request unread would
+        // reset the connection, which can discard the reply before it is read.
+        let _ = socket.read_to_end(&mut Vec::new()).await;
+    });
+    Client::new_with_address(&address).await.unwrap()
 }
