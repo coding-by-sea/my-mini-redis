@@ -1,10 +1,8 @@
-use super::frame::Error as FrameError;
-use super::frame::Frame;
+use super::frame::{self, Frame};
 use super::request::{Parser, ProtocolError};
-use anyhow;
 use bytes::{Buf, Bytes, BytesMut};
 use std::io::{Cursor, Error, ErrorKind};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedReadHalf;
 
@@ -14,10 +12,17 @@ const READ_SIZE: usize = 4096;
 /// is then run, and its replies and published messages sent, in a few large steps
 /// instead of one per 4 KiB, as Redis reads up to 16 KiB at a time.
 const MAX_READ_SIZE: usize = 64 * 1024;
+/// A client's write buffer larger than this, grown by one large frame, is freed after
+/// the write rather than kept for the life of the connection.
+const WRITE_BUFFER_KEEP_LIMIT: usize = 64 * 1024;
 
+/// The client's side of a connection: writes frames and reads replies.
 pub struct Connection {
-    stream: BufWriter<TcpStream>,
+    stream: TcpStream,
+    /// Bytes received but not yet parsed into a frame.
     buffer: BytesMut,
+    /// Reused to encode each outgoing frame, so it goes out in one write.
+    write_buffer: BytesMut,
 }
 
 /// The server's reading side of a connection; the connection's outbox has the
@@ -43,20 +48,22 @@ pub(crate) enum ReadRequestError {
 impl Connection {
     pub fn new(stream: TcpStream) -> Connection {
         Connection {
-            // Large enough to hold a typical pipelined batch, so it goes out in one
-            // write.
-            stream: BufWriter::with_capacity(64 * 1024, stream),
-            buffer: BytesMut::with_capacity(4096),
+            stream,
+            buffer: BytesMut::with_capacity(READ_SIZE),
+            write_buffer: BytesMut::with_capacity(READ_SIZE),
         }
     }
 
-    pub async fn read_frame(&mut self) -> Result<Option<Frame>, anyhow::Error> {
+    /// Reads the next frame. Returns `Ok(None)` if the server closed the connection
+    /// between frames; closing in the middle of one is an error.
+    ///
+    /// Cancel safe: it only awaits `read_buf`, so dropping it loses no data.
+    pub async fn read_frame(&mut self) -> anyhow::Result<Option<Frame>> {
         loop {
-            if let Some(frame) = self.parse_frame().await? {
+            if let Some(frame) = self.parse_frame()? {
                 return Ok(Some(frame));
             }
             if self.stream.read_buf(&mut self.buffer).await? == 0 {
-                // the read side of the stream is closed
                 return if self.buffer.is_empty() {
                     Ok(None)
                 } else {
@@ -66,82 +73,29 @@ impl Connection {
         }
     }
 
-    async fn parse_frame(&mut self) -> Result<Option<Frame>, anyhow::Error> {
+    /// Takes the first frame out of `buffer` if it has arrived in full.
+    fn parse_frame(&mut self) -> Result<Option<Frame>, frame::Error> {
         let mut cursor = Cursor::new(&self.buffer[..]);
         match Frame::check(&mut cursor) {
-            Ok(_) => {
+            Ok(()) => {
                 let len = cursor.position() as usize;
                 cursor.set_position(0);
-                let frame = Frame::read_frame(&mut cursor)?;
+                let frame = Frame::parse(&mut cursor)?;
                 self.buffer.advance(len);
                 Ok(Some(frame))
             }
-            Err(FrameError::IncompleteFrame) => Ok(None),
-            Err(e) => Err(e.into()),
+            Err(frame::Error::IncompleteFrame) => Ok(None),
+            Err(error) => Err(error),
         }
     }
 
-    pub async fn write_frame(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
-        self.write_value(frame).await?;
-        let res = self.stream.flush().await;
-        if let Err(e) = res {
-            Err(e.into())
-        } else {
-            Ok(())
+    pub async fn write_frame(&mut self, frame: Frame) -> anyhow::Result<()> {
+        self.write_buffer.clear();
+        frame.encode(&mut self.write_buffer);
+        self.stream.write_all(&self.write_buffer).await?;
+        if self.write_buffer.capacity() > WRITE_BUFFER_KEEP_LIMIT {
+            self.write_buffer = BytesMut::with_capacity(READ_SIZE);
         }
-    }
-
-    async fn write_value(&mut self, frame: Frame) -> Result<(), anyhow::Error> {
-        match frame {
-            Frame::Simple(response) => {
-                self.stream.write_u8(b'+').await?;
-                self.stream.write_all(response.as_ref()).await?;
-                self.stream.write_all(b"\r\n").await?;
-                Ok(())
-            }
-            Frame::Error(response) => {
-                self.stream.write_u8(b'-').await?;
-                self.stream.write_all(response.as_ref()).await?;
-                self.stream.write_all(b"\r\n").await?;
-                Ok(())
-            }
-            Frame::Integer(response) => {
-                self.stream.write_u8(b':').await?;
-                self.write_decimal(response).await
-            }
-            Frame::Bulk(response) => {
-                self.stream.write_u8(b'$').await?;
-                self.write_decimal(response.len() as i64).await?;
-
-                self.stream.write_all(response.as_ref()).await?;
-                self.stream.write_all(b"\r\n").await?;
-                Ok(())
-            }
-            Frame::Array(response) => {
-                self.stream.write_u8(b'*').await?;
-                self.write_decimal(response.len() as i64).await?;
-                for val in response {
-                    Box::pin(self.write_value(val)).await?;
-                }
-                Ok(())
-            }
-            Frame::Null => {
-                self.stream.write_all(b"$-1\r\n").await?;
-                Ok(())
-            }
-        }
-    }
-
-    async fn write_decimal(&mut self, response: i64) -> Result<(), anyhow::Error> {
-        use std::io::Write;
-        let mut string = [0u8; 20];
-        let mut buf = Cursor::new(&mut string[..]);
-        write!(&mut buf, "{}", response)?;
-
-        let pos = buf.position() as usize;
-        self.stream.write_all(&buf.get_ref()[..pos]).await?;
-        self.stream.write_all(b"\r\n").await?;
-
         Ok(())
     }
 }
