@@ -164,7 +164,7 @@ impl Session {
     /// Runs one request, encoding its replies.
     ///
     /// A db lock is only held for the step of a command that reads or changes shared
-    /// state: the keys' lock for GET and SET, the pub/sub lock for the rest. Messages
+    /// state: a key's shard for GET and SET, the pub/sub lock for the rest. Messages
     /// reach the outbox under the pub/sub lock, so SUBSCRIBE,
     /// UNSUBSCRIBE and RESET move their replies to the outbox before releasing it: a
     /// channel's messages then come after its subscribe acknowledgment and before its
@@ -194,11 +194,11 @@ impl Session {
 
         match command {
             Command::Get(cmd) => {
-                let value = lock(&self.db.entries).get(cmd.key()).cloned();
+                let value = self.db.entries.get(cmd.key()).map(|value| value.clone());
                 self.reply(value.map_or(Frame::Null, Frame::Bulk), Next::Continue)
             }
             Command::Set(cmd) => {
-                lock(&self.db.entries).insert(cmd.key().clone(), cmd.value());
+                self.db.entries.insert(cmd.key().clone(), cmd.value());
                 self.reply(Frame::Simple("OK".into()), Next::Continue)
             }
             Command::Publish(cmd) => {
