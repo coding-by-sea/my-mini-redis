@@ -87,6 +87,9 @@ struct Options {
     /// Publisher connections in the pub/sub scenario.
     #[arg(long, default_value_t = 4)]
     publishers: usize,
+    /// Channels the pub/sub subscribers are spread over; publishers rotate through them.
+    #[arg(long, default_value_t = 1)]
+    channels: usize,
     /// Idle connections opened to measure memory per connection.
     #[arg(long, default_value_t = 1000)]
     memory_connections: usize,
@@ -113,10 +116,12 @@ enum Scenario {
     ClientSet,
     ClientGet,
     Pubsub,
+    /// Pipelined SET while the pub/sub scenario runs: how much they slow each other.
+    Mixed,
 }
 
 impl Scenario {
-    const ALL: [Scenario; 7] = [
+    const ALL: [Scenario; 8] = [
         Scenario::Ping,
         Scenario::Set,
         Scenario::Get,
@@ -124,6 +129,7 @@ impl Scenario {
         Scenario::ClientSet,
         Scenario::ClientGet,
         Scenario::Pubsub,
+        Scenario::Mixed,
     ];
 
     fn describe(self, load: &Load) -> String {
@@ -136,10 +142,25 @@ impl Scenario {
             Scenario::ClientSet => "SET via Client (1 in flight)".into(),
             Scenario::ClientGet => "GET via Client (1 in flight)".into(),
             Scenario::Pubsub => format!(
-                "PUBLISH to {} subscribers ({} publishers, pipeline {pipeline})",
-                load.subscribers, load.publishers
+                "PUBLISH to {} subscribers{} ({} publishers, pipeline {pipeline})",
+                load.subscribers,
+                channels_suffix(load),
+                load.publishers
+            ),
+            Scenario::Mixed => format!(
+                "SET (raw, pipeline {pipeline}) during PUBLISH to {} subscribers{}",
+                load.subscribers,
+                channels_suffix(load)
             ),
         }
+    }
+}
+
+fn channels_suffix(load: &Load) -> String {
+    if load.channels > 1 {
+        format!(" on {} channels", load.channels)
+    } else {
+        String::new()
     }
 }
 
@@ -152,6 +173,7 @@ struct Load {
     keyspace: usize,
     subscribers: usize,
     publishers: usize,
+    channels: usize,
     warmup: f64,
     duration: f64,
 }
@@ -198,8 +220,11 @@ async fn main() -> anyhow::Result<()> {
     };
     anyhow::ensure!(options.payload >= 8, "--payload must be at least 8 bytes");
     anyhow::ensure!(
-        options.clients > 0 && options.pipeline > 0 && options.publishers > 0,
-        "--clients, --pipeline and --publishers must be positive"
+        options.clients > 0
+            && options.pipeline > 0
+            && options.publishers > 0
+            && options.channels > 0,
+        "--clients, --pipeline, --publishers and --channels must be positive"
     );
     if options.only.is_empty() {
         options.only = Scenario::ALL.to_vec();
@@ -301,11 +326,15 @@ struct Record {
     measurement: Measurement,
 }
 
-const SWEEPS: [(&str, &str); 4] = [
+const SWEEPS: [(&str, &str); 5] = [
     ("pipeline", "Pipeline depth: SET, 50 connections"),
     ("connections", "Concurrent connections: SET, pipeline 16"),
     ("payload", "Payload size: SET, 50 connections, pipeline 16"),
     ("fan-out", "Pub/sub fan-out: 4 publishers, pipeline 16"),
+    (
+        "channels",
+        "Pub/sub channels: 100 subscribers, 4 publishers, pipeline 16",
+    ),
 ];
 
 impl Bench {
@@ -318,6 +347,7 @@ impl Bench {
             keyspace: o.keyspace,
             subscribers: o.subscribers,
             publishers: o.publishers,
+            channels: o.channels,
             warmup: o.warmup,
             duration: o.duration,
         }
@@ -385,6 +415,20 @@ impl Bench {
                         Scenario::Pubsub,
                         Load {
                             subscribers: n,
+                            ..base.clone()
+                        },
+                    )
+                })
+                .collect(),
+            "channels" => pick(&[1, 10, 100], &[1, 2])
+                .into_iter()
+                .map(|n| {
+                    (
+                        format!("{n} channel{}", if n == 1 { "" } else { "s" }),
+                        Scenario::Pubsub,
+                        Load {
+                            subscribers: if smoke { 2 } else { 100 },
+                            channels: n,
                             ..base.clone()
                         },
                     )
@@ -894,6 +938,7 @@ struct Measurement {
 }
 
 struct PubsubResult {
+    publishes: u64,
     deliveries: u64,
     latency: Histogram,
     disconnected: usize,
@@ -923,6 +968,13 @@ async fn run_scenario(
         Scenario::Pubsub => {
             let (stats, pubsub) = pubsub(address, load, window).await?;
             (stats, Some(pubsub))
+        }
+        Scenario::Mixed => {
+            let (sets, published) = tokio::try_join!(
+                raw(address, load, window, set_command),
+                pubsub(address, load, window)
+            )?;
+            (sets, Some(published.1))
         }
     };
     let mut usage = sampler.await?;
@@ -1042,31 +1094,39 @@ async fn with_client(
     join(workers).await
 }
 
-/// Pub/sub fan-out at full speed: every message should reach every subscriber.
-/// Returns the publishers' stats and what the subscribers received.
+/// Pub/sub fan-out at full speed: every message should reach every subscriber of its
+/// channel. Subscriber `i` joins channel `i % channels`, and publishers rotate through
+/// the channels. Returns the publishers' stats and what the subscribers received.
 async fn pubsub(
     address: &str,
     load: &Load,
     window: Window,
 ) -> anyhow::Result<(Stats, PubsubResult)> {
-    const CHANNEL: &[u8] = b"bench:fanout";
+    let channels: Arc<Vec<Vec<u8>>> = Arc::new(
+        (0..load.channels)
+            .map(|c| format!("bench:fanout:{c}").into_bytes())
+            .collect(),
+    );
     let mut subscribers = Vec::new();
-    for _ in 0..load.subscribers {
+    for index in 0..load.subscribers {
+        let channel = index % load.channels;
         let mut connection = RawConnection::connect(address).await?;
         let mut request = Vec::new();
-        encode(&[b"SUBSCRIBE", CHANNEL], &mut request);
+        encode(&[b"SUBSCRIBE", &channels[channel]], &mut request);
         connection.send(&request).await?;
         connection.expect_reply(|reply| reply.ok()).await?;
-        subscribers.push(connection);
+        subscribers.push((channel, connection));
     }
 
     // Timestamps in payloads are nanoseconds since `origin`, shared by every task.
     let origin = Instant::now();
     let publishing_done = Arc::new(AtomicBool::new(false));
-    let published = Arc::new(AtomicU64::new(0));
+    // Messages published so far, per channel.
+    let published: Arc<Vec<AtomicU64>> =
+        Arc::new((0..load.channels).map(|_| AtomicU64::new(0)).collect());
 
     let mut receivers = Vec::new();
-    for mut connection in subscribers {
+    for (channel, mut connection) in subscribers {
         let (publishing_done, published) = (publishing_done.clone(), published.clone());
         receivers.push(tokio::spawn(async move {
             let mut stats = Stats::default();
@@ -1074,7 +1134,7 @@ async fn pubsub(
             let mut disconnected = false;
             loop {
                 if publishing_done.load(Ordering::Acquire)
-                    && received >= published.load(Ordering::Acquire)
+                    && received >= published[channel].load(Ordering::Acquire)
                 {
                     break;
                 }
@@ -1102,29 +1162,39 @@ async fn pubsub(
     }
 
     let mut publishers = Vec::new();
-    for _ in 0..load.publishers {
-        let (load, address, published) = (load.clone(), address.to_string(), published.clone());
+    for publisher in 0..load.publishers {
+        let (load, address) = (load.clone(), address.to_string());
+        let (channels, published) = (channels.clone(), published.clone());
         publishers.push(tokio::spawn(async move {
             let mut connection = RawConnection::connect(&address).await?;
             let mut stats = Stats::default();
             let mut payload = vec![b'x'; load.payload];
             let mut batch = Vec::new();
+            let mut next_channel = publisher % load.channels;
+            let mut counts = vec![0u64; load.channels];
             loop {
                 let started = Instant::now();
                 if started >= window.end {
                     break;
                 }
                 batch.clear();
+                counts.iter_mut().for_each(|count| *count = 0);
                 for _ in 0..load.pipeline {
                     let timestamp = origin.elapsed().as_nanos() as u64;
                     payload[..8].copy_from_slice(&timestamp.to_le_bytes());
-                    encode(&[b"PUBLISH", CHANNEL, &payload], &mut batch);
+                    encode(&[b"PUBLISH", &channels[next_channel], &payload], &mut batch);
+                    counts[next_channel] += 1;
+                    next_channel = (next_channel + 1) % load.channels;
                 }
                 connection.send(&batch).await?;
                 for _ in 0..load.pipeline {
                     connection.expect_reply(|reply| reply.ok()).await?;
                 }
-                published.fetch_add(load.pipeline as u64, Ordering::AcqRel);
+                for (channel, count) in counts.iter().enumerate() {
+                    if *count > 0 {
+                        published[channel].fetch_add(*count, Ordering::AcqRel);
+                    }
+                }
                 window.record(&mut stats, started, load.pipeline as u64);
             }
             Ok::<_, anyhow::Error>(stats)
@@ -1140,9 +1210,11 @@ async fn pubsub(
         delivery.merge(&stats);
         disconnected += was_disconnected as usize;
     }
+    let publishes = publish_stats.ops;
     Ok((
         publish_stats,
         PubsubResult {
+            publishes,
             deliveries: delivery.ops,
             latency: delivery.latency,
             disconnected,
@@ -1513,7 +1585,8 @@ impl Bench {
             .records
             .iter()
             .filter(|r| {
-                r.measurement.pubsub.is_some() && (r.section == "summary" || r.section == "fan-out")
+                r.measurement.pubsub.is_some()
+                    && matches!(r.section, "summary" | "fan-out" | "channels")
             })
             .collect();
         if !pubsub.is_empty() {
@@ -1539,13 +1612,9 @@ impl Bench {
                 let _ = writeln!(
                     md,
                     "| {} | {} | {} | {} | {} | {} | {} | {} | {} of {} | {} | {} |",
-                    if record.section == "summary" {
-                        "summary".to_string()
-                    } else {
-                        record.label.clone()
-                    },
+                    record.label,
                     record.server,
-                    format_count(d.ops_per_sec),
+                    format_count(p.publishes as f64 / record.load.duration),
                     format_count(p.deliveries as f64 / record.load.duration),
                     latency[0].map_or("-".into(), format_nanos),
                     latency[2].map_or("-".into(), format_nanos),
@@ -1851,7 +1920,7 @@ impl Bench {
         for record in self
             .records
             .iter()
-            .filter(|r| r.section == "summary" && r.measurement.pubsub.is_some())
+            .filter(|r| r.section == "summary" && r.scenario == Scenario::Pubsub)
         {
             let pubsub = record.measurement.pubsub.as_ref().unwrap();
             let d = Derived::new(record);
@@ -2000,7 +2069,9 @@ impl Bench {
                     Some(p) => {
                         let delivery: Vec<String> = histogram_summary(&p.latency).iter().map(|v| json_number(v.map(|v| v as f64))).collect();
                         format!(
-                            ", \"deliveries_per_sec\": {:.1}, \"delivery_latency_ns\": [{}], \"disconnected\": {}",
+                            ", \"channels\": {}, \"publishes_per_sec\": {:.1}, \"deliveries_per_sec\": {:.1}, \"delivery_latency_ns\": [{}], \"disconnected\": {}",
+                            l.channels,
+                            p.publishes as f64 / l.duration,
                             p.deliveries as f64 / l.duration,
                             delivery.join(", "),
                             p.disconnected
