@@ -101,5 +101,5 @@ The last comparisons used a resumable harness that keeps each run's raw output: 
 ## What is left
 
 - **Merging writes across publishers** (see above): about 2x Redis's writes per delivery remain.
-- **SET and GET throughput:** keys are still behind one lock that serializes every SET and GET. SET runs at about 0.36x Redis on 10 cores, while my-mini-redis on one thread beats Redis. Sharding the keyspace is the next step there.
+- **SET and GET throughput:** keys were still behind one lock that serializes every SET and GET. *Done: see [sharded keys](2026-11-17-sharded-keys.md); SET went from 0.35x to 2.31x Redis.*
 - **Delivery tail under mixed load:** 3.7 ms against Redis's 0.88 ms.
