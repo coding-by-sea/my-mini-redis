@@ -16,7 +16,7 @@ This project implements a **Redis server speaking the RESP2 wire protocol** from
 - **Binary-safe keys, values and channel names** stored as reference-counted `Bytes`
 - **Async connection handling** with `tokio::select!` across incoming requests and pending writes
 
-Key Technics:
+Key Techniques:
 - Async runtime internals (Tokio)
 - Buffer management with `Bytes` and `BytesMut` (shared values, reused I/O buffers)
 - Connection-oriented state machines
@@ -93,7 +93,7 @@ Measured with `scripts/bench.sh` at commit `09ce574`; full report: [docs/benchma
 
 3. **Few, large writes**: after running its whole batch of pipelined requests, a publishing connection writes each subscriber's outbox to its socket itself, outside the pub/sub lock, as Redis writes pending clients once per event loop pass. Each subscriber gets the batch in one write, and its task is only woken if its socket is full, or for subscribers beyond the first 512. Sending per message instead gave about 3 messages per write, which made write syscalls the bottleneck (see [the pub/sub deep dive](docs/benchmarks/2026-11-16-pubsub-deep-dive.md)). Reads also grow from 4 KiB up to 64 KiB while they keep filling the buffer, so a pipelined batch runs in few steps.
 
-4. **One writer per socket at a time**: several connections can now write to one socket, so a writer token keeps Redis's rule that a socket has a single writer. Only the token holder writes, from the head of the outbox; everyone else only appends, and the holder sends what they appended before releasing the token. Writers other than the connection's own task never wait: when the socket is full, they hand the token to that task.
+4. **One writer per socket at a time**: several connections can write to one socket, so a writer token keeps Redis's rule that a socket has a single writer. Only the token holder writes, from the head of the outbox; everyone else only appends, and the holder sends what they appended before releasing the token. Writers other than the connection's own task never wait: when the socket is full, they hand the token to that task.
 
 5. **Sharded keys, and a separate lock for pub/sub**: keys live in a `DashMap`, whose shards each have their own read-write lock, so `GET` and `SET` on different keys rarely contend. With one lock over all keys, pipelined `SET`s from 50 connections spent about 60% of the server's CPU waking each other on unlock. `PUBLISH`, `SUBSCRIBE` and `UNSUBSCRIBE` take the pub/sub registry's lock, so a fan-out to many subscribers doesn't hold up key commands, and a burst of `SET`s doesn't starve publishers. Pub/sub keeps one lock rather than one per channel, so every subscriber sees publishes in the same order.
 
@@ -164,6 +164,10 @@ Commands are checked against Redis's arity table, and errors use Redis's exact t
 
 ---
 
+### Prerequisites
+
+Rust 1.86 or later (the crate uses edition 2024). The benchmark comparison also needs `redis-server` on the `PATH`.
+
 ### Running the Server
 
 ```bash
@@ -199,6 +203,25 @@ unsubscribe              # leave every channel
 ```
 
 There is no standalone `unsubscribe` command: subscriptions belong to a connection, and each CLI run opens a new one.
+
+### Using the Client Library
+
+The package is named `my-redis`, so the library is imported as `my_redis`. `Client` connects to `MY_MINI_REDIS_ADDRESS`'s default, `127.0.0.1:6379` (or any address with `Client::new_with_address`):
+
+```rust
+use my_redis::client::Client;
+
+let mut client = Client::new().await?;
+client.set("hello", "world".into()).await?;
+let value = client.get("hello").await?; // Some(b"world")
+
+let mut subscriber = Client::new().await?;
+subscriber.subscribe_multiple(&["events", "logs"]).await?;
+client.publish("events", "deployed".into()).await?; // number of receivers
+let message = subscriber.next_message().await?; // Some(Message { channel, payload })
+```
+
+With a server running, `cargo run --example hello-redis` runs [`examples/hello-redis.rs`](examples/hello-redis.rs).
 
 ### Environment Configuration
 
@@ -301,8 +324,8 @@ cargo test --test redis_compat
 
 ### Test Coverage
 
-- **32 Unit Tests**: RESP frame encoding and decoding, request parsing (RESP and inline, including requests split across reads), the client connection and its pub/sub push parsing, 3 pub/sub channel-cleanup tests, and 2 stress tests of pub/sub delivery with several writers per socket
-- **21 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, the client library's error paths, and CLI subscribe mode driven through stdin
+- **32 Unit Tests**: RESP frame encoding and decoding, client connection reads and writes, pub/sub push classification in the client, request parsing (RESP and inline, including requests split across reads), 3 pub/sub channel-cleanup tests, and 2 stress tests checking that frames stay whole and ordered with concurrent writers per socket
+- **21 Integration Tests**: Multi-client pub/sub scenarios, idempotent subscriptions, unsubscribe-all semantics, client error handling, and CLI subscribe mode driven through stdin
 - **35 Redis Compatibility Tests**: Raw-RESP checks of Redis wire behavior, run against Redis 7.2.5 in CI
 - **4 CLI Parsing Tests**: Clap argument validation
 
@@ -342,6 +365,13 @@ my-mini-redis/
 ├── tests/
 │   ├── cli_integration.rs     # End-to-end integration tests
 │   └── redis_compat.rs        # Redis wire-compatibility tests (raw RESP)
+├── benches/
+│   └── load.rs                # Load benchmark against a real Redis
+├── scripts/
+│   ├── bench.sh               # Runs the load benchmark (raises the open-file limit)
+│   ├── compare.sh             # Interleaved runs of several server builds
+│   └── summarize.py           # Mean per build from compare.sh results
+├── .github/workflows/         # ci, bench (manual), rolling (latest dependencies)
 ├── docs/benchmarks/           # Benchmark reports (Markdown and JSON)
 ├── examples/
 │   └── hello-redis.rs         # Example usage
