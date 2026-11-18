@@ -197,6 +197,24 @@ scripts/bench.sh --help         # all options
 
 You can also run it from the Actions tab (the `bench` workflow), which adds the report to the job summary.
 
+### Comparing builds
+
+`scripts/compare.sh` runs chosen scenarios against several my-mini-redis binaries, for example `main` and a branch, with their repetitions interleaved so drift affects them alike. `scripts/summarize.py` then prints the mean per build:
+
+```bash
+git worktree add ../base main && cargo build --release --manifest-path ../base/Cargo.toml
+cargo build --release
+cat > cases.txt <<'CASES'
+set     --only set --duration 9
+mixed   --only mixed --duration 9
+CASES
+scripts/compare.sh --reps 3 results cases.txt \
+    base=../base/target/release/my-mini-redis-server new=target/release/my-mini-redis-server
+scripts/summarize.py results
+```
+
+Each run keeps its raw JSON and Markdown reports and a `meta.json` (arguments, binary hash, commit) in its own directory. The script is resumable: finished runs are skipped, so the same command continues after an interruption, retries failed runs, or adds repetitions when `--reps` grows. Parsing is a separate step that reads only the stored JSON, so it can be re-run on old results. On Linux, `--perf` also counts the server's syscalls with `perf stat`.
+
 ---
 
 ## 🚧 Work in Progress
