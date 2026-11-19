@@ -39,3 +39,8 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", 
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
+# Never built: raises the lowest version that -Zminimal-versions picks for a
+# transitive dependency whose own lower bound no longer compiles.
+[target.'cfg(any())'.dependencies]
+lazy_static = "1.4"
