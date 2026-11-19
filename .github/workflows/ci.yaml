@@ -56,6 +56,20 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  diagnostics:
+    # The optional tokio-console and OpenTelemetry support, which other jobs don't build.
+    name: stable / clippy (console, otel)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg tokio_unstable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets --locked --features console,otel -- -D warnings
+
   msrv:
     # Keep in sync with `rust-version` in Cargo.toml. Checks the library and binaries;
     # tests may use newer APIs.

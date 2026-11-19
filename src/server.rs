@@ -9,6 +9,7 @@ use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, sleep};
+use tracing::{Instrument, debug, debug_span, error, trace};
 
 /// How long to wait before accepting again after `accept` fails, for example because
 /// the process ran out of file descriptors and must wait for connections to close.
@@ -38,10 +39,10 @@ impl Server {
 
     pub async fn run_with_listener(&mut self, listener: TcpListener) {
         loop {
-            let socket = match listener.accept().await {
-                Ok((socket, _)) => socket,
+            let (socket, peer) = match listener.accept().await {
+                Ok(accepted) => accepted,
                 Err(error) => {
-                    eprintln!("ERROR accepting connection: {error}");
+                    error!("accepting connection: {error}");
                     sleep(ACCEPT_RETRY_DELAY).await;
                     continue;
                 }
@@ -50,14 +51,22 @@ impl Server {
             // small reply written while an earlier one is unacknowledged waits for the
             // client's delayed ACK (40 ms on Linux), stalling pipelined clients.
             if let Err(error) = socket.set_nodelay(true) {
-                eprintln!("ERROR setting TCP_NODELAY: {error}");
+                error!(%peer, "setting TCP_NODELAY: {error}");
             }
             let db = self.db.clone();
-            tokio::spawn(async move {
-                if let Err(error) = Server::handle(socket, db).await {
-                    eprintln!("ERROR on connection: {error:#}");
+            // At debug level, so that by default the span is disabled: an enabled span
+            // calls into the subscriber on every poll of the connection's task.
+            let span = debug_span!("connection", %peer);
+            tokio::spawn(
+                async move {
+                    debug!("opened");
+                    match Server::handle(socket, db).await {
+                        Ok(()) => debug!("closed"),
+                        Err(error) => error!(%peer, "connection: {error:#}"),
+                    }
                 }
-            });
+                .instrument(span),
+            );
         }
     }
 
@@ -185,6 +194,7 @@ impl Session {
         &mut self,
         ProtocolError(message): ProtocolError,
     ) -> anyhow::Result<()> {
+        debug!("protocol error: {message}");
         error_frame(format!("ERR Protocol error: {message}")).encode(&mut self.replies);
         self.push_replies();
         self.outbox.finish().await?;
@@ -214,6 +224,7 @@ impl Session {
             Ok(command) => command,
             Err(message) => return self.reply(error_frame(message), Next::Continue),
         };
+        trace!(command = command.name(), "command");
         if !self.subscriptions.is_empty() && !command.allowed_while_subscribed() {
             let error = error_frame(format!(
                 "ERR Can't execute '{}': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET are allowed in this context",

@@ -228,7 +228,33 @@ With a server running, `cargo run --example hello-redis` runs [`examples/hello-r
 ```bash
 # Override default server address
 export MY_REDIS_ADDRESS="127.0.0.1:6380"
+
+# Server logging, to stderr: info (default) logs startup and errors, debug adds
+# connections opening and closing, trace adds every command
+RUST_LOG=debug cargo run --release --bin my-redis-server
 ```
+
+### Diagnostics: tokio-console and OpenTelemetry
+
+Two optional features add more instrumentation. Both are off by default because they slow the server down, so don't benchmark with them on.
+
+```bash
+# tokio-console: tasks, wakers and resources, live. Needs tokio's unstable APIs;
+# a separate target dir keeps the different RUSTFLAGS from rebuilding everything.
+cargo install --locked tokio-console
+RUSTFLAGS="--cfg tokio_unstable" CARGO_TARGET_DIR=target/unstable \
+    cargo run --release --features console --bin my-redis-server
+tokio-console                   # in another terminal; connects to 127.0.0.1:6669
+
+# OpenTelemetry: spans over OTLP/HTTP to a collector, here Jaeger
+# (OTEL_EXPORTER_OTLP_ENDPOINT, default http://localhost:4318). Spans follow
+# RUST_LOG: debug exports a span per connection, trace adds every command to it.
+docker run --rm -d --name jaeger -p 16686:16686 -p 4318:4318 jaegertracing/jaeger:latest
+RUST_LOG=debug cargo run --release --features otel --bin my-redis-server
+# then open http://localhost:16686 and pick the service "my-redis"
+```
+
+Spans are exported in batches from a background thread; stop the server with Ctrl-C so it exports the last ones.
 
 ### Benchmarking against Redis
 

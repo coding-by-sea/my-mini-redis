@@ -11,6 +11,13 @@ anyhow = "1.0.20"
 atoi = "3"
 clap = { version = "4.4.2", features = ["derive"] }
 dashmap = "6.2.1"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["fmt", "env-filter", "ansi", "std", "registry"] }
+console-subscriber = { version = "0.5.0", optional = true }
+opentelemetry = { version = "0.33.1", default-features = false, features = ["trace"], optional = true }
+opentelemetry_sdk = { version = "0.33.1", default-features = false, features = ["trace"], optional = true }
+opentelemetry-otlp = { version = "0.33.1", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"], optional = true }
+tracing-opentelemetry = { version = "0.34.0", default-features = false, optional = true }
 
 [[bin]]
 name = "my-redis-cli"
@@ -23,3 +30,17 @@ path = "src/bin/server.rs"
 [[bench]]
 name = "load"
 harness = false
+
+[features]
+# Diagnostics, off by default because they slow the server down; see the README.
+# `console` also needs RUSTFLAGS="--cfg tokio_unstable".
+console = ["dep:console-subscriber", "tokio/tracing"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tokio_unstable)"] }
+
+# Never built: raises the lowest version that -Zminimal-versions picks for a
+# transitive dependency whose own lower bound no longer compiles.
+[target.'cfg(any())'.dependencies]
+lazy_static = "1.4"
